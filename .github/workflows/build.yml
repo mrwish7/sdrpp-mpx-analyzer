@@ -1,0 +1,86 @@
+name: Build
+
+on:
+    push:
+    pull_request:
+    workflow_dispatch:
+        inputs:
+            sdrpp_ref:
+                description: "SDR++ branch, tag or commit to build against (must match the SDR++ build that will load the plugin)"
+                required: false
+                default: "master"
+
+env:
+    SDRPP_REF: ${{ inputs.sdrpp_ref || 'master' }}
+
+jobs:
+    build_windows:
+        runs-on: windows-latest
+
+        steps:
+        - name: Checkout plugin
+          uses: actions/checkout@v4
+          with:
+              path: plugin
+
+        - name: Checkout SDR++
+          uses: actions/checkout@v4
+          with:
+              repository: AlexandreRouma/SDRPlusPlus
+              ref: ${{ env.SDRPP_REF }}
+              path: SDRPlusPlus
+
+        # Same dependency setup as SDR++'s own Windows build (only what sdrpp_core needs)
+        - name: Download PothosSDR
+          run: Invoke-WebRequest -Uri "https://downloads.myriadrf.org/builds/PothosSDR/PothosSDR-2020.01.26-vc14-x64.exe" -OutFile ${{runner.workspace}}/pothos.exe
+
+        - name: Install PothosSDR
+          run: mkdir "C:/Program Files/PothosSDR" ; 7z x ${{runner.workspace}}/pothos.exe -o"C:/Program Files/PothosSDR/"
+
+        - name: Install vcpkg dependencies
+          run: vcpkg install fftw3:x64-windows glfw3:x64-windows zstd:x64-windows
+
+        - name: Configure
+          run: cmake -S plugin -B build "-DSDRPP_SOURCE_DIR=$Env:GITHUB_WORKSPACE/SDRPlusPlus" "-DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake"
+
+        - name: Build
+          run: cmake --build build --config Release --target mpx_analyzer
+
+        - name: Package
+          run: |
+            mkdir dist
+            cp build/Release/mpx_analyzer.dll dist/
+            cp plugin/README.md, plugin/LICENSE dist/
+            "Built against SDR++ commit $(git -C SDRPlusPlus rev-parse HEAD) ($(git -C SDRPlusPlus log -1 --format=%cd --date=iso))" | Out-File -Encoding utf8 dist/SDRPP_VERSION.txt
+            Get-Content dist/SDRPP_VERSION.txt
+
+        - name: Upload
+          uses: actions/upload-artifact@v4
+          with:
+              name: mpx_analyzer_windows_x64
+              path: dist/
+
+    build_linux:
+        runs-on: ubuntu-latest
+
+        steps:
+        - name: Checkout plugin
+          uses: actions/checkout@v4
+          with:
+              path: plugin
+
+        - name: Checkout SDR++
+          uses: actions/checkout@v4
+          with:
+              repository: AlexandreRouma/SDRPlusPlus
+              ref: ${{ env.SDRPP_REF }}
+              path: SDRPlusPlus
+
+        - name: Install dependencies
+          run: sudo apt-get update && sudo apt-get install -y build-essential cmake pkg-config libfftw3-dev libvolk-dev libglfw3-dev libzstd-dev libgl-dev
+
+        - name: Configure
+          run: cmake -S plugin -B build -DSDRPP_SOURCE_DIR=$GITHUB_WORKSPACE/SDRPlusPlus
+
+        - name: Build
+          run: cmake --build build -j$(nproc) --target mpx_analyzer
