@@ -1,6 +1,7 @@
 #pragma once
 #include <dsp/demod/quadrature.h>
-#include <dsp/multirate/rational_resampler.h>
+#include <dsp/filter/decimating_fir.h>
+#include <dsp/taps/low_pass.h>
 #include <dsp/sink/handler_sink.h>
 #include <dsp/window/blackman_harris.h>
 #include <utils/wav.h>
@@ -21,12 +22,37 @@
 // Deviation that maps to +/-1.0 at the demodulator output (broadcast FM full deviation)
 #define MPX_DEVIATION       75000.0
 
+// Anti-alias filter for the /2 decimation. Windowed sinc so the passband is flat for level measurements
+#define MPX_DECIM_CUTOFF    91000.0
+#define MPX_DECIM_TRANS     10000.0
+
 #define MPX_FFT_SIZE        4096
 #define MPX_FFT_BINS        ((MPX_FFT_SIZE / 2) + 1)
 #define MPX_FFT_HOP         (MPX_FFT_SIZE / 2)
 
 // Split recordings before the 4GiB limit of the 32bit WAV size fields
 #define MPX_MAX_WAV_BYTES   4000000000ULL
+
+// Level metering is done in 100ms blocks
+#define MPX_METER_BLOCK         19200
+#define MPX_POWER_LONG_BLOCKS   600     // 60s integration for MPX power (ITU-R BS.412)
+#define MPX_POWER_SHORT_BLOCKS  10      // 1s short term MPX power
+#define MPX_PEAK_BLOCKS         10      // Peak deviation over the last 1s
+#define MPX_SETTLE_BLOCKS       5       // Blocks ignored after a reset while the DC filter settles
+
+// 0dBr = power of a sine giving +/-19kHz deviation (ITU-R BS.412), in demodulator units (1.0 = 75kHz)
+#define MPX_POWER_REF           (((19000.0 / MPX_DEVIATION) * (19000.0 / MPX_DEVIATION)) / 2.0)
+
+// One pole DC removal (~3Hz) so a slightly off-centre carrier doesn't affect the measurements
+#define MPX_DC_ALPHA            1e-4f
+
+struct MPXMeasurements {
+    float powerDBr;         // MPX power over the last 60s (or since reset, if shorter)
+    float powerShortDBr;    // MPX power over the last 1s
+    float powerSeconds;     // Seconds integrated in powerDBr (up to 60)
+    float peakDevKHz;       // Peak deviation over the last 1s
+    float maxDevKHz;        // Peak deviation since reset
+};
 
 // FM demodulator -> 192kHz MPX -> (WAV recorder, spectrum analyzer)
 class MPXChain {
@@ -51,6 +77,12 @@ public:
         fftIn = (float*)fftwf_malloc(MPX_FFT_SIZE * sizeof(float));
         fftOut = (fftwf_complex*)fftwf_malloc(MPX_FFT_BINS * sizeof(fftwf_complex));
         plan = fftwf_plan_dft_r2c_1d(MPX_FFT_SIZE, fftIn, fftOut, FFTW_ESTIMATE);
+
+        // Decimation filter, normalized to exactly unity gain
+        decimTaps = dsp::taps::lowPass(MPX_DECIM_CUTOFF, MPX_DECIM_TRANS, MPX_IF_SAMPLERATE, true);
+        double tapSum = 0.0;
+        for (int i = 0; i < decimTaps.size; i++) { tapSum += decimTaps.taps[i]; }
+        for (int i = 0; i < decimTaps.size; i++) { decimTaps.taps[i] /= tapSum; }
     }
 
     ~MPXChain() {
@@ -59,12 +91,13 @@ public:
         fftwf_destroy_plan(plan);
         fftwf_free(fftIn);
         fftwf_free(fftOut);
+        dsp::taps::free(decimTaps);
     }
 
     void init(dsp::stream<dsp::complex_t>* in) {
         demod.init(in, MPX_DEVIATION, MPX_IF_SAMPLERATE);
-        resamp.init(&demod.out, MPX_IF_SAMPLERATE, MPX_SAMPLERATE);
-        sink.init(&resamp.out, handler, this);
+        decim.init(&demod.out, decimTaps, (int)(MPX_IF_SAMPLERATE / MPX_SAMPLERATE));
+        sink.init(&decim.out, handler, this);
     }
 
     void setInput(dsp::stream<dsp::complex_t>* in) {
@@ -74,7 +107,7 @@ public:
     void start() {
         if (running) { return; }
         demod.start();
-        resamp.start();
+        decim.start();
         sink.start();
         running = true;
     }
@@ -82,7 +115,7 @@ public:
     void stop() {
         if (!running) { return; }
         demod.stop();
-        resamp.stop();
+        decim.stop();
         sink.stop();
         running = false;
     }
@@ -104,6 +137,21 @@ public:
         if (!specValid) { return false; }
         avg = outAvg;
         peak = outPeak;
+        return true;
+    }
+
+    // ---- Measurements ----
+
+    // Restart the MPX power integration and peak deviation hold (e.g. after retuning)
+    void resetMeasurements() {
+        measReset = true;
+    }
+
+    // Returns false while there isn't any measurement yet (just started or reset)
+    bool getMeasurements(MPXMeasurements& meas) {
+        std::lock_guard<std::mutex> lck(measMtx);
+        if (!measValid) { return false; }
+        meas = measOut;
         return true;
     }
 
@@ -148,6 +196,76 @@ private:
         MPXChain* _this = (MPXChain*)ctx;
         _this->record(data, count);
         _this->analyze(data, count);
+        _this->measure(data, count);
+    }
+
+    void measure(float* data, int count) {
+        if (measReset.exchange(false)) {
+            powerFill = 0;
+            powerPos = 0;
+            peakFill = 0;
+            peakPos = 0;
+            maxPeak = 0.0f;
+            blkSumSq = 0.0;
+            blkPeak = 0.0f;
+            blkCount = 0;
+            settleBlocks = MPX_SETTLE_BLOCKS;
+            std::lock_guard<std::mutex> lck(measMtx);
+            measValid = false;
+        }
+
+        for (int i = 0; i < count; i++) {
+            dcEst += MPX_DC_ALPHA * (data[i] - dcEst);
+            float x = data[i] - dcEst;
+            blkSumSq += x * x;
+            blkPeak = std::max<float>(blkPeak, fabsf(x));
+            if (++blkCount == MPX_METER_BLOCK) { finishBlock(); }
+        }
+    }
+
+    void finishBlock() {
+        double meanSq = blkSumSq / (double)MPX_METER_BLOCK;
+        float peak = blkPeak;
+        blkSumSq = 0.0;
+        blkPeak = 0.0f;
+        blkCount = 0;
+
+        // Let the DC filter settle after a reset (e.g. a retune) before measuring
+        if (settleBlocks > 0) {
+            settleBlocks--;
+            return;
+        }
+
+        powerRing[powerPos] = meanSq;
+        powerPos = (powerPos + 1) % MPX_POWER_LONG_BLOCKS;
+        powerFill = std::min<int>(powerFill + 1, MPX_POWER_LONG_BLOCKS);
+
+        peakRing[peakPos] = peak;
+        peakPos = (peakPos + 1) % MPX_PEAK_BLOCKS;
+        peakFill = std::min<int>(peakFill + 1, MPX_PEAK_BLOCKS);
+        maxPeak = std::max<float>(maxPeak, peak);
+
+        // Average over the most recent blocks
+        double longSum = 0.0, shortSum = 0.0;
+        int shortCount = std::min<int>(powerFill, MPX_POWER_SHORT_BLOCKS);
+        for (int k = 1; k <= powerFill; k++) {
+            double p = powerRing[(powerPos - k + MPX_POWER_LONG_BLOCKS) % MPX_POWER_LONG_BLOCKS];
+            longSum += p;
+            if (k <= shortCount) { shortSum += p; }
+        }
+        float recentPeak = 0.0f;
+        for (int k = 0; k < peakFill; k++) { recentPeak = std::max<float>(recentPeak, peakRing[k]); }
+
+        MPXMeasurements meas;
+        meas.powerDBr = 10.0 * log10(std::max<double>(longSum / powerFill, 1e-20) / MPX_POWER_REF);
+        meas.powerShortDBr = 10.0 * log10(std::max<double>(shortSum / shortCount, 1e-20) / MPX_POWER_REF);
+        meas.powerSeconds = (powerFill * MPX_METER_BLOCK) / MPX_SAMPLERATE;
+        meas.peakDevKHz = recentPeak * (MPX_DEVIATION / 1000.0);
+        meas.maxDevKHz = maxPeak * (MPX_DEVIATION / 1000.0);
+
+        std::lock_guard<std::mutex> lck(measMtx);
+        measOut = meas;
+        measValid = true;
     }
 
     void record(float* data, int count) {
@@ -208,7 +326,8 @@ private:
 
     // DSP
     dsp::demod::Quadrature demod;
-    dsp::multirate::RationalResampler<float> resamp;
+    dsp::tap<float> decimTaps;
+    dsp::filter::DecimatingFIR<float, float> decim;
     dsp::sink::Handler<float> sink;
     bool running = false;
 
@@ -233,6 +352,26 @@ private:
     bool firstFrame = true;
     std::atomic<float> avgAlpha = 0.1f;
     std::atomic<bool> peakReset = false;
+
+    // Measurements (DSP thread only)
+    float dcEst = 0.0f;
+    double blkSumSq = 0.0;
+    float blkPeak = 0.0f;
+    int blkCount = 0;
+    int settleBlocks = MPX_SETTLE_BLOCKS;
+    double powerRing[MPX_POWER_LONG_BLOCKS];
+    int powerPos = 0;
+    int powerFill = 0;
+    float peakRing[MPX_PEAK_BLOCKS];
+    int peakPos = 0;
+    int peakFill = 0;
+    float maxPeak = 0.0f;
+    std::atomic<bool> measReset = false;
+
+    // Measurements (shared with the GUI)
+    std::mutex measMtx;
+    MPXMeasurements measOut;
+    bool measValid = false;
 
     // Spectrum (shared with the GUI)
     std::mutex specMtx;

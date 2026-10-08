@@ -19,6 +19,8 @@
 #define MPX_MAX_BANDWIDTH       350000.0
 #define MPX_DEFAULT_BANDWIDTH   250000.0
 
+#define MPX_METER_FONT_SCALE    1.6f
+
 SDRPP_MOD_INFO{
     /* Name:            */ "mpx_analyzer",
     /* Description:     */ "FM MPX spectrum analyzer and recorder for SDR++",
@@ -86,6 +88,7 @@ public:
     void enable() {
         vfo = createVFO();
         chain.setInput(vfo->output);
+        chain.resetMeasurements();
         chain.start();
         enabled = true;
     }
@@ -172,6 +175,18 @@ private:
         if (gui::waterfall.selectedVFO == name) {
             gui::waterfall.selectedVFO = followName;
             gui::waterfall.selectedVFOChanged = true;
+        }
+    }
+
+    // Measurements from a different station or filter setting shouldn't be mixed
+    void checkRetune() {
+        if (!enabled || !vfo) { return; }
+        double freq = getFrequency();
+        double bw = vfo->getBandwidth();
+        if (freq != measFreq || bw != measBandwidth) {
+            chain.resetMeasurements();
+            measFreq = freq;
+            measBandwidth = bw;
         }
     }
 
@@ -338,6 +353,7 @@ private:
     static void fftRedraw(ImGui::WaterFall::FFTRedrawArgs args, void* ctx) {
         MPXAnalyzerModule* _this = (MPXAnalyzerModule*)ctx;
         _this->followVFO();
+        _this->checkRetune();
         _this->drawWindow();
     }
 
@@ -363,13 +379,19 @@ private:
 
         float s = style::uiScale;
         ImGui::SetNextWindowSize(ImVec2(720.0f * s, 340.0f * s), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSizeConstraints(ImVec2(320.0f * s, 180.0f * s), ImVec2(FLT_MAX, FLT_MAX));
+        ImGui::SetNextWindowSizeConstraints(ImVec2(440.0f * s, 280.0f * s), ImVec2(FLT_MAX, FLT_MAX));
 
         bool open = true;
         std::string title = "MPX Spectrum (" + name + ")###_mpx_win_" + name;
         if (ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
             drawToolbar();
-            drawPlot();
+
+            // Spectrum on the left, level readouts on the right
+            ImVec2 avail = ImGui::GetContentRegionAvail();
+            float metersWidth = getMetersWidth();
+            drawPlot(ImVec2(avail.x - metersWidth - ImGui::GetStyle().ItemSpacing.x, avail.y));
+            ImGui::SameLine();
+            drawMeters(metersWidth);
         }
         winMin = ImGui::GetWindowPos();
         winMax = ImVec2(winMin.x + ImGui::GetWindowWidth(), winMin.y + ImGui::GetWindowHeight());
@@ -414,10 +436,79 @@ private:
         ImGui::TextDisabled("0 dB = %.0f kHz dev.", MPX_DEVIATION / 1000.0);
     }
 
-    void drawPlot() {
+    float getMetersWidth() {
+        ImGui::SetWindowFontScale(MPX_METER_FONT_SCALE);
+        float valueWidth = ImGui::CalcTextSize("-00.0 dBr").x;
+        ImGui::SetWindowFontScale(1.0f);
+        float labelWidth = ImGui::CalcTextSize("1 s: -00.0 dBr").x;
+        return std::max<float>(valueWidth, labelWidth) + 8.0f * style::uiScale;
+    }
+
+    void drawMeters(float width) {
+        MPXMeasurements meas;
+        bool valid = enabled && chain.getMeasurements(meas);
+        ImVec4 normalCol = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+        ImVec4 warnCol = ImVec4(1.0f, 0.65f, 0.0f, 1.0f);
+        ImVec4 overCol = ImVec4(1.0f, 0.2f, 0.2f, 1.0f);
+
+        ImGui::BeginGroup();
+        ImGui::PushItemWidth(width);
+
+        // MPX power (ITU-R BS.412)
+        ImGui::TextDisabled("MPX power");
+        ImGui::SetWindowFontScale(MPX_METER_FONT_SCALE);
+        if (valid) {
+            ImGui::TextColored((meas.powerDBr > 0.0f) ? warnCol : normalCol, "%+.1f dBr", meas.powerDBr);
+        }
+        else {
+            ImGui::TextDisabled("--.- dBr");
+        }
+        ImGui::SetWindowFontScale(1.0f);
+        if (valid) {
+            if (meas.powerSeconds < 59.95f) {
+                ImGui::TextDisabled("%.0f s avg", meas.powerSeconds);
+            }
+            else {
+                ImGui::TextDisabled("60 s avg");
+            }
+            ImGui::TextDisabled("1 s: %+.1f dBr", meas.powerShortDBr);
+        }
+        else {
+            ImGui::TextDisabled("60 s avg");
+            ImGui::TextDisabled("1 s: --.- dBr");
+        }
+
+        ImGui::Spacing();
+        ImGui::Spacing();
+
+        // Peak deviation
+        ImGui::TextDisabled("Deviation");
+        ImGui::SetWindowFontScale(MPX_METER_FONT_SCALE);
+        if (valid) {
+            ImGui::TextColored((meas.peakDevKHz > MPX_DEVIATION / 1000.0) ? overCol : normalCol, "%.1f kHz", meas.peakDevKHz);
+        }
+        else {
+            ImGui::TextDisabled("--.- kHz");
+        }
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::TextDisabled("1 s peak");
+        if (valid) {
+            ImGui::TextColored((meas.maxDevKHz > MPX_DEVIATION / 1000.0) ? overCol : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled), "Max: %.1f kHz", meas.maxDevKHz);
+        }
+        else {
+            ImGui::TextDisabled("Max: --.- kHz");
+        }
+
+        ImGui::Spacing();
+        if (ImGui::SmallButton(CONCAT("Reset##_mpx_meas_reset_", name))) { chain.resetMeasurements(); }
+
+        ImGui::PopItemWidth();
+        ImGui::EndGroup();
+    }
+
+    void drawPlot(ImVec2 size) {
         float s = style::uiScale;
         ImVec2 pos = ImGui::GetCursorScreenPos();
-        ImVec2 size = ImGui::GetContentRegionAvail();
         if (size.x < 50.0f * s || size.y < 50.0f * s) { return; }
 
         ImGui::InvisibleButton(CONCAT("##_mpx_plot_", name), size);
@@ -570,6 +661,8 @@ private:
     ImVec2 winMin;
     ImVec2 winMax;
     bool mouseCaptured = false;
+    double measFreq = 0.0;
+    double measBandwidth = 0.0;
 
     EventHandler<ImGui::WaterFall::FFTRedrawArgs> fftRedrawHandler;
     EventHandler<ImGui::WaterFall::InputHandlerArgs> inputHandler;

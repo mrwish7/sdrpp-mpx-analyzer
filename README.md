@@ -18,6 +18,17 @@ The Radio's WFM default bandwidth of 150 kHz is narrow for MPX work. It cuts int
 
 **Levels:** the demodulator output is scaled so that ±1.0 = ±75 kHz deviation. On the spectrum, **0 dB is a sine at 75 kHz deviation**. A 9% (6.75 kHz) pilot therefore reads about −21 dB, and RDS at 2–4 kHz injection reads roughly −30 to −40 dB, spread over its ~5 kHz bandwidth.
 
+**Measurements** (shown to the right of the spectrum):
+- **MPX power (dBr):** the power of the complete MPX signal (audio, pilot, RDS and everything else), as defined in ITU-R BS.412.
+  - **Reference:** 0 dBr is the power of a sine tone giving ±19 kHz deviation.
+  - **Main reading:** the RMS over a sliding 60-second window, as BS.412 specifies. For the first minute after tuning it shows the average so far, with the time covered (e.g. "12 s avg").
+  - **Short-term reading:** a 1-second value is shown underneath for spotting changes quickly.
+  - **Highlight:** the reading turns amber above 0 dBr, the most common limit. Some regulators allow +3 or +6 dBr.
+- **Deviation (kHz):** the peak frequency deviation over the last second, plus a max hold. Both turn red above ±75 kHz.
+  - **What "peak" means here:** this is the true sample peak of the demodulated signal, so noise on weak signals pushes it up. Professional modulation meters may apply extra filtering or a peak-counting rule, so expect small differences from them.
+- **Reset:** the measurements restart automatically when the frequency or bandwidth changes. *Reset* restarts them by hand.
+- **Accuracy:** a slow DC filter removes any carrier offset first, so slight mistuning doesn't affect the readings. The IF filter does affect them: a narrow bandwidth (e.g. the Radio's 150 kHz WFM default) distorts the MPX and changes both readings. For measurements, use a bandwidth of about 200–250 kHz on a clean signal.
+
 **WAV files:**
 - **Sample format:** Int16 (default) is enough for most uses and keeps files small. Int32 gives more dynamic range. Both clip at ±75 kHz deviation; choose Float32 if you need to capture over-deviating stations without clipping.
 - **Bandwidth:** 192 kHz sampling gives a 96 kHz Nyquist limit. Content up to about 90 kHz is clean.
