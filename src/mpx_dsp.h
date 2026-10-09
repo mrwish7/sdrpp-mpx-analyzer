@@ -4,6 +4,8 @@
 #include <dsp/taps/low_pass.h>
 #include <dsp/sink/handler_sink.h>
 #include <dsp/window/blackman_harris.h>
+#include <dsp/window/hann.h>
+#include <dsp/buffer/buffer.h>
 #include <utils/wav.h>
 #include <utils/flog.h>
 #include <fftw3.h>
@@ -46,12 +48,39 @@
 // One pole DC removal (~3Hz) so a slightly off-centre carrier doesn't affect the measurements
 #define MPX_DC_ALPHA            1e-4f
 
+// Subcarrier levels. 19k and 57k both have a whole number of cycles in this many samples at 192kHz
+#define MPX_TONE_TABLE          384
+#define MPX_PILOT_FREQ          19000.0
+#define MPX_RDS_FREQ            57000.0
+
+// Pilot amplitude from 10ms Hann windowed correlations (~ +/-100Hz detector)
+#define MPX_PILOT_BLOCK         1920
+#define MPX_PILOT_MIN_KHZ       0.5f    // Below this the station is considered to have no pilot
+
+// RDS is shifted to 0Hz, filtered to its bandwidth and decimated to 12kHz
+#define MPX_RDS_DECIM           16
+#define MPX_RDS_CUTOFF          3000.0  // Flat to 2.4kHz (RDS bandwidth), rejects L-R audio from 4kHz below 57kHz
+#define MPX_RDS_TRANS           1200.0
+#define MPX_RDS_CHUNK           4096
+#define MPX_RDS_SUB_BLOCK       120     // 10ms at 12kHz
+#define MPX_RDS_MIN_KHZ         0.3f
+// Biphase coded RDS has almost no energy at exactly 57kHz while noise does. Noise power in the band is
+// estimated from the power of 10ms means (~ +/-50Hz around 57kHz), see computeNoiseDcFraction()
+// RDS is considered present when its power is at least this many times the noise power in its band
+#define MPX_RDS_MIN_SNR         2.0
+// Peak/RMS ratio of a standard RDS signal (EN 50067 biphase symbol shaping), to report peak deviation
+#define MPX_RDS_CREST_FACTOR    1.444
+
 struct MPXMeasurements {
     float powerDBr;         // MPX power over the last 60s (or since reset, if shorter)
     float powerShortDBr;    // MPX power over the last 1s
     float powerSeconds;     // Seconds integrated in powerDBr (up to 60)
     float peakDevKHz;       // Peak deviation over the last 1s
     float maxDevKHz;        // Peak deviation since reset
+    float pilotKHz;         // 19kHz pilot level (deviation) over the last 1s
+    bool pilotPresent;
+    float rdsKHz;           // RDS level (peak deviation, from noise corrected RMS) over the last 1s
+    bool rdsPresent;
 };
 
 // FM demodulator -> 192kHz MPX -> (WAV recorder, spectrum analyzer)
@@ -83,6 +112,30 @@ public:
         double tapSum = 0.0;
         for (int i = 0; i < decimTaps.size; i++) { tapSum += decimTaps.taps[i]; }
         for (int i = 0; i < decimTaps.size; i++) { decimTaps.taps[i] /= tapSum; }
+
+        // Subcarrier reference tables
+        for (int i = 0; i < MPX_TONE_TABLE; i++) {
+            double t = (double)i / MPX_SAMPLERATE;
+            pilotCos[i] = cos(2.0 * FL_M_PI * MPX_PILOT_FREQ * t);
+            pilotSin[i] = sin(2.0 * FL_M_PI * MPX_PILOT_FREQ * t);
+            rdsCos[i] = cos(2.0 * FL_M_PI * MPX_RDS_FREQ * t);
+            rdsSin[i] = sin(2.0 * FL_M_PI * MPX_RDS_FREQ * t);
+        }
+        pilotWin.resize(MPX_PILOT_BLOCK);
+        pilotWinSum = 0.0;
+        for (int i = 0; i < MPX_PILOT_BLOCK; i++) {
+            pilotWin[i] = dsp::window::hann(i, MPX_PILOT_BLOCK);
+            pilotWinSum += pilotWin[i];
+        }
+
+        // RDS channel filter, only used through process() (not run as a block)
+        rdsTaps = dsp::taps::lowPass(MPX_RDS_CUTOFF, MPX_RDS_TRANS, MPX_SAMPLERATE);
+        rdsFir.init(NULL, rdsTaps, MPX_RDS_DECIM);
+        rdsFir.out.free();
+        rdsMix = dsp::buffer::alloc<dsp::complex_t>(MPX_RDS_CHUNK);
+        rdsBase = dsp::buffer::alloc<dsp::complex_t>(MPX_RDS_CHUNK);
+        rdsNoiseDcFraction = computeDcFraction(false);
+        rdsSignalDcFraction = computeDcFraction(true);
     }
 
     ~MPXChain() {
@@ -92,6 +145,9 @@ public:
         fftwf_free(fftIn);
         fftwf_free(fftOut);
         dsp::taps::free(decimTaps);
+        dsp::taps::free(rdsTaps);
+        dsp::buffer::free(rdsMix);
+        dsp::buffer::free(rdsBase);
     }
 
     void init(dsp::stream<dsp::complex_t>* in) {
@@ -155,6 +211,19 @@ public:
         return true;
     }
 
+    // ---- Audio output ----
+
+    // Sends the 192kHz MPX (copied to both channels) to `out`, or stops when NULL
+    void setAudioOutput(dsp::stream<dsp::stereo_t>* out) {
+        // Release the DSP thread if it's waiting on the old output
+        dsp::stream<dsp::stereo_t>* old = audioOut;
+        if (old) { old->stopWriter(); }
+
+        std::lock_guard<std::mutex> lck(audioMtx);
+        if (old) { old->clearWriteStop(); }
+        audioOut = out;
+    }
+
     // ---- Recording ----
 
     // `nextPath` is called to name the first file and each split file when the 4GiB limit is reached
@@ -195,8 +264,16 @@ private:
     static void handler(float* data, int count, void* ctx) {
         MPXChain* _this = (MPXChain*)ctx;
         _this->record(data, count);
+        _this->output(data, count);
         _this->analyze(data, count);
         _this->measure(data, count);
+    }
+
+    void output(float* data, int count) {
+        std::lock_guard<std::mutex> lck(audioMtx);
+        if (!audioOut) { return; }
+        for (int i = 0; i < count; i++) { audioOut->writeBuf[i] = { data[i], data[i] }; }
+        audioOut->swap(count);
     }
 
     void measure(float* data, int count) {
@@ -210,16 +287,112 @@ private:
             blkPeak = 0.0f;
             blkCount = 0;
             settleBlocks = MPX_SETTLE_BLOCKS;
+            pilotI = pilotQ = 0.0;
+            pilotCount = 0;
+            pilotAmpSum = 0.0;
+            pilotAmpCount = 0;
+            rdsSubSum = { 0.0f, 0.0f };
+            rdsSubPow = 0.0;
+            rdsSubCount = 0;
+            rdsDcPow = rdsTotPow = 0.0;
+            rdsSubBlocks = 0;
             std::lock_guard<std::mutex> lck(measMtx);
             measValid = false;
         }
+
+        measureRDS(data, count);
 
         for (int i = 0; i < count; i++) {
             dcEst += MPX_DC_ALPHA * (data[i] - dcEst);
             float x = data[i] - dcEst;
             blkSumSq += x * x;
             blkPeak = std::max<float>(blkPeak, fabsf(x));
+
+            // Pilot: correlate with 19kHz over a windowed block
+            float wx = pilotWin[pilotCount] * x;
+            pilotI += wx * pilotCos[pilotPos];
+            pilotQ -= wx * pilotSin[pilotPos];
+            pilotPos = (pilotPos + 1) % MPX_TONE_TABLE;
+            if (++pilotCount == MPX_PILOT_BLOCK) {
+                pilotAmpSum += 2.0 * sqrt((pilotI * pilotI) + (pilotQ * pilotQ)) / pilotWinSum;
+                pilotAmpCount++;
+                pilotI = pilotQ = 0.0;
+                pilotCount = 0;
+            }
+
             if (++blkCount == MPX_METER_BLOCK) { finishBlock(); }
+        }
+    }
+
+    // Fraction of the power (after the RDS filter) that ends up in the 10ms means, for white noise (rds = false)
+    // or for a standard RDS signal (rds = true)
+    double computeDcFraction(bool rds) {
+        const double outRate = MPX_SAMPLERATE / MPX_RDS_DECIM;
+        const double td = 1.0 / 1187.5;
+        const int points = 4096;
+        double total = 0.0, dc = 0.0;
+        for (int p = 0; p < points; p++) {
+            // Frequencies across the decimated band (-outRate/2 .. outRate/2)
+            double f = ((p + 0.5) / points - 0.5) * outRate;
+
+            // Filter response
+            double re = 0.0, im = 0.0;
+            for (int i = 0; i < rdsTaps.size; i++) {
+                double ph = -2.0 * FL_M_PI * f * i / MPX_SAMPLERATE;
+                re += rdsTaps.taps[i] * cos(ph);
+                im += rdsTaps.taps[i] * sin(ph);
+            }
+            double h2 = (re * re) + (im * im);
+
+            // EN 50067 RDS spectrum: biphase symbol pair times the cos shaping, zero above 2/td
+            if (rds) {
+                double af = fabs(f);
+                double shaping = (af <= 2.0 / td) ? cos(FL_M_PI * af * td / 4.0) : 0.0;
+                double biphase = sin(FL_M_PI * af * td / 2.0);
+                h2 *= (shaping * shaping) * (biphase * biphase);
+            }
+
+            // Response of the mean over MPX_RDS_SUB_BLOCK samples
+            double x = FL_M_PI * f / outRate;
+            double d = (fabs(sin(x)) < 1e-12) ? 1.0 : sin(MPX_RDS_SUB_BLOCK * x) / (MPX_RDS_SUB_BLOCK * sin(x));
+
+            total += h2;
+            dc += h2 * d * d;
+        }
+        return dc / total;
+    }
+
+    void measureRDS(float* data, int count) {
+        for (int off = 0; off < count; off += MPX_RDS_CHUNK) {
+            int n = std::min<int>(MPX_RDS_CHUNK, count - off);
+
+            // Shift 57kHz to 0Hz, then filter and decimate
+            for (int i = 0; i < n; i++) {
+                float x = data[off + i];
+                rdsMix[i] = { x * rdsCos[rdsPos], -x * rdsSin[rdsPos] };
+                rdsPos = (rdsPos + 1) % MPX_TONE_TABLE;
+            }
+            int outCount = rdsFir.process(n, rdsMix, rdsBase);
+
+            for (int i = 0; i < outCount; i++) {
+                dsp::complex_t z = rdsBase[i];
+                float pow = (z.re * z.re) + (z.im * z.im);
+
+                // Power close to 57kHz (10ms means) vs total power, to tell RDS from noise
+                rdsSubSum.re += z.re;
+                rdsSubSum.im += z.im;
+                rdsSubPow += pow;
+                if (++rdsSubCount == MPX_RDS_SUB_BLOCK) {
+                    float mre = rdsSubSum.re / MPX_RDS_SUB_BLOCK;
+                    float mim = rdsSubSum.im / MPX_RDS_SUB_BLOCK;
+                    rdsDcPow += (mre * mre) + (mim * mim);
+                    rdsTotPow += rdsSubPow / MPX_RDS_SUB_BLOCK;
+                    rdsSubBlocks++;
+                    rdsSubSum = { 0.0f, 0.0f };
+                    rdsSubPow = 0.0;
+                    rdsSubCount = 0;
+                }
+            }
         }
     }
 
@@ -229,6 +402,14 @@ private:
         blkSumSq = 0.0;
         blkPeak = 0.0f;
         blkCount = 0;
+
+        float pilotAmp = pilotAmpCount ? (pilotAmpSum / pilotAmpCount) : 0.0f;
+        pilotAmpSum = 0.0;
+        pilotAmpCount = 0;
+        double rdsDc = rdsSubBlocks ? (rdsDcPow / rdsSubBlocks) : 0.0;
+        double rdsTot = rdsSubBlocks ? (rdsTotPow / rdsSubBlocks) : 0.0;
+        rdsDcPow = rdsTotPow = 0.0;
+        rdsSubBlocks = 0;
 
         // Let the DC filter settle after a reset (e.g. a retune) before measuring
         if (settleBlocks > 0) {
@@ -241,6 +422,9 @@ private:
         powerFill = std::min<int>(powerFill + 1, MPX_POWER_LONG_BLOCKS);
 
         peakRing[peakPos] = peak;
+        pilotRing[peakPos] = pilotAmp;
+        rdsDcRing[peakPos] = rdsDc;
+        rdsTotRing[peakPos] = rdsTot;
         peakPos = (peakPos + 1) % MPX_PEAK_BLOCKS;
         peakFill = std::min<int>(peakFill + 1, MPX_PEAK_BLOCKS);
         maxPeak = std::max<float>(maxPeak, peak);
@@ -254,7 +438,13 @@ private:
             if (k <= shortCount) { shortSum += p; }
         }
         float recentPeak = 0.0f;
-        for (int k = 0; k < peakFill; k++) { recentPeak = std::max<float>(recentPeak, peakRing[k]); }
+        double pilotSum = 0.0, rdsDcSum = 0.0, rdsTotSum = 0.0;
+        for (int k = 0; k < peakFill; k++) {
+            recentPeak = std::max<float>(recentPeak, peakRing[k]);
+            pilotSum += pilotRing[k];
+            rdsDcSum += rdsDcRing[k];
+            rdsTotSum += rdsTotRing[k];
+        }
 
         MPXMeasurements meas;
         meas.powerDBr = 10.0 * log10(std::max<double>(longSum / powerFill, 1e-20) / MPX_POWER_REF);
@@ -262,6 +452,18 @@ private:
         meas.powerSeconds = (powerFill * MPX_METER_BLOCK) / MPX_SAMPLERATE;
         meas.peakDevKHz = recentPeak * (MPX_DEVIATION / 1000.0);
         meas.maxDevKHz = maxPeak * (MPX_DEVIATION / 1000.0);
+        meas.pilotKHz = (pilotSum / peakFill) * (MPX_DEVIATION / 1000.0);
+        meas.pilotPresent = (meas.pilotKHz >= MPX_PILOT_MIN_KHZ);
+
+        // RDS: split the band power into signal and noise using how much of each falls close to 57kHz:
+        //   total = signal + noise,  dc = rdsSignalDcFraction * signal + rdsNoiseDcFraction * noise
+        // then RMS -> peak. A DSB signal a(t)cos(wt) becomes a(t)/2 at 0Hz
+        double rdsTotal = rdsTotSum / peakFill;
+        double rdsDcPower = rdsDcSum / peakFill;
+        double rdsSignal = std::clamp<double>(((rdsNoiseDcFraction * rdsTotal) - rdsDcPower) / (rdsNoiseDcFraction - rdsSignalDcFraction), 0.0, rdsTotal);
+        double rdsNoise = rdsTotal - rdsSignal;
+        meas.rdsKHz = 2.0 * sqrt(rdsSignal) * MPX_RDS_CREST_FACTOR * (MPX_DEVIATION / 1000.0);
+        meas.rdsPresent = (meas.rdsKHz >= MPX_RDS_MIN_KHZ) && (rdsSignal >= MPX_RDS_MIN_SNR * rdsNoise);
 
         std::lock_guard<std::mutex> lck(measMtx);
         measOut = meas;
@@ -331,6 +533,10 @@ private:
     dsp::sink::Handler<float> sink;
     bool running = false;
 
+    // Audio output
+    std::mutex audioMtx;
+    dsp::stream<dsp::stereo_t>* audioOut = NULL;
+
     // Recording
     std::mutex recMtx;
     wav::Writer writer{ 1, (uint64_t)MPX_SAMPLERATE, wav::FORMAT_WAV, wav::SAMP_TYPE_FLOAT32 };
@@ -367,6 +573,35 @@ private:
     int peakFill = 0;
     float maxPeak = 0.0f;
     std::atomic<bool> measReset = false;
+
+    // Pilot and RDS level (DSP thread only)
+    float pilotCos[MPX_TONE_TABLE];
+    float pilotSin[MPX_TONE_TABLE];
+    float rdsCos[MPX_TONE_TABLE];
+    float rdsSin[MPX_TONE_TABLE];
+    std::vector<float> pilotWin;
+    double pilotWinSum;
+    int pilotPos = 0;
+    double pilotI = 0.0, pilotQ = 0.0;
+    int pilotCount = 0;
+    double pilotAmpSum = 0.0;
+    int pilotAmpCount = 0;
+    float pilotRing[MPX_PEAK_BLOCKS];
+
+    dsp::tap<float> rdsTaps;
+    dsp::filter::DecimatingFIR<dsp::complex_t, float> rdsFir;
+    dsp::complex_t* rdsMix;
+    dsp::complex_t* rdsBase;
+    int rdsPos = 0;
+    dsp::complex_t rdsSubSum = { 0.0f, 0.0f };
+    double rdsSubPow = 0.0;
+    int rdsSubCount = 0;
+    double rdsDcPow = 0.0, rdsTotPow = 0.0;
+    int rdsSubBlocks = 0;
+    double rdsNoiseDcFraction;
+    double rdsSignalDcFraction;
+    double rdsDcRing[MPX_PEAK_BLOCKS];
+    double rdsTotRing[MPX_PEAK_BLOCKS];
 
     // Measurements (shared with the GUI)
     std::mutex measMtx;

@@ -26,6 +26,13 @@ The Radio's WFM default bandwidth of 150 kHz is narrow for MPX work. It cuts int
   - **Highlight:** the reading turns amber above 0 dBr, the most common limit. Some regulators allow +3 or +6 dBr.
 - **Deviation (kHz):** the peak frequency deviation over the last second, plus a max hold. Both turn red above ±75 kHz.
   - **What "peak" means here:** this is the true sample peak of the demodulated signal, so noise on weak signals pushes it up. Professional modulation meters may apply extra filtering or a peak-counting rule, so expect small differences from them.
+- **Pilot (kHz):** the level of the 19 kHz stereo pilot as deviation, averaged over 1 second. A typical 9% pilot reads 6.75 kHz; hover over it to see it as a percentage.
+  - **How:** the MPX is correlated with a 19 kHz reference over 10 ms windows, so stereo audio and noise hardly affect it.
+  - **No pilot:** shows "none" below 0.5 kHz, e.g. on mono stations.
+- **RDS (kHz):** the RDS injection level as peak deviation, averaged over 1 second. Typical values are 2–4 kHz; hover over it to see it as a percentage.
+  - **How:** the 57 kHz band is shifted to 0 Hz and filtered to the RDS bandwidth. RDS has almost no energy exactly at 57 kHz, while noise does, so the noise in the band is estimated and removed. The remaining RMS level is converted to peak deviation using the crest factor of a standard EN 50067 RDS signal (1.444).
+  - **Result:** readings stay accurate on noisy signals, matching a peak reading on a clean one.
+  - **No RDS:** shows "none" when there's no RDS, i.e. when the band holds less than twice as much RDS power as noise, or the level is below 0.3 kHz.
 - **Reset:** the measurements restart automatically when the frequency or bandwidth changes. *Reset* restarts them by hand.
 - **Accuracy:** a slow DC filter removes any carrier offset first, so slight mistuning doesn't affect the readings. The IF filter does affect them: a narrow bandwidth (e.g. the Radio's 150 kHz WFM default) distorts the MPX and changes both readings. For measurements, use a bandwidth of about 200–250 kHz on a clean signal.
 
@@ -83,7 +90,18 @@ Use the standalone build and copy `mpx_analyzer.dylib` into the app bundle's `Pl
 1. Start SDR++. Open **Module Manager**, choose `mpx_analyzer` in the type list, give it a name (e.g. `MPX`) and press **+**.
 2. Tune the Radio VFO to an FM broadcast station. The plugin's orange VFO follows it, and the **MPX Spectrum** window appears. It stays open when the menu is collapsed; reopen it with *Show MPX window* after closing it.
 3. Hover over the spectrum to read frequency and level. Enable **Peak hold** to catch transients.
-4. Choose a folder and sample type, then press **Record MPX**.
+4. Choose a folder and sample type in the plugin's menu section, then press **Record MPX**. You can also use the **red record button** at the top right of the MPX window; it turns into a square stop button, with the elapsed time beside it, while recording.
+
+### Sending the MPX to a sound device (Windows, Linux, macOS)
+
+Tick **Audio output** in the plugin menu; it's off by default. The plugin then adds an audio stream named after the plugin instance (e.g. `MPX`) to SDR++'s **Sinks** menu, separate from the Radio's decoded audio.
+1. **Pick the output:** in the Sinks menu, choose the `MPX` stream's sink (*Audio*) and its output device.
+2. **Pick the rate:** choose **192000 Hz**, so the MPX passes through unchanged.
+   - **Lower rates:** if the device only offers lower rates, the MPX is resampled to the chosen rate and the plugin menu shows a warning, because content above half that rate is lost. At 48 kHz, for example, nothing above 24 kHz survives, so the RDS is lost and so are most of the stereo subcarriers.
+3. **Level:** full scale (±1.0) is 75 kHz deviation, the same as the WAV recordings. The stream's volume slider in the Sinks menu can reduce it if over-deviating stations clip.
+4. **Other sinks:** the same stream can also go to the *Network* sink, sending MPX at 192 kHz over TCP or UDP.
+
+SDR++ remembers the device and rate selection for the stream. The option isn't available on Android.
 
 ### Menu options
 
@@ -95,7 +113,9 @@ Use the standalone build and copy `mpx_analyzer.dylib` into the app bundle's `Pl
 | Max Freq | Upper edge of the display (20–96 kHz) |
 | dB Max / dB Min | Vertical scale |
 | Peak hold | Overlay the maximum level seen since the last reset |
+| Level units | Show deviation, pilot and RDS levels in kHz (default) or percent, where 100% = 75 kHz. Hover over Pilot/RDS to see the other unit |
 | Sample type | Int16 (default) / Int32 / Float32 WAV samples |
+| Audio output | Send the MPX to an SDR++ sink (sound device / network), configured in the Sinks menu. Off by default; not on Android |
 
 ## License
 

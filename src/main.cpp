@@ -11,6 +11,8 @@
 #include <filesystem>
 #include <regex>
 #include <ctime>
+#include <cstdarg>
+#include <dsp/multirate/rational_resampler.h>
 #include "mpx_dsp.h"
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
@@ -19,7 +21,7 @@
 #define MPX_MAX_BANDWIDTH       350000.0
 #define MPX_DEFAULT_BANDWIDTH   250000.0
 
-#define MPX_METER_FONT_SCALE    1.6f
+#define MPX_METER_FONT_SCALE    1.4f
 
 SDRPP_MOD_INFO{
     /* Name:            */ "mpx_analyzer",
@@ -63,6 +65,13 @@ public:
         chain.setAveraging(avgFrames);
         chain.start();
 
+        // Optional MPX output to an SDR++ sink (sound device, network...)
+        audioSrHandler.ctx = this;
+        audioSrHandler.handler = audioSampleRateChanged;
+        audioResamp.init(&audioIn, MPX_SAMPLERATE, MPX_SAMPLERATE);
+        audioStream.init(&audioResamp.out, &audioSrHandler, MPX_SAMPLERATE);
+        if (audioOutput) { startAudioOutput(); }
+
         // Draw the window every frame (not only when the menu is open) and block waterfall input under it
         fftRedrawHandler.ctx = this;
         fftRedrawHandler.handler = fftRedraw;
@@ -79,6 +88,7 @@ public:
         gui::waterfall.onFFTRedraw.unbindHandler(&fftRedrawHandler);
         gui::waterfall.onInputProcess.unbindHandler(&inputHandler);
         chain.stopRecording();
+        stopAudioOutput();
         chain.stop();
         if (vfo) { sigpath::vfoManager.deleteVFO(vfo); }
     }
@@ -91,10 +101,12 @@ public:
         chain.resetMeasurements();
         chain.start();
         enabled = true;
+        if (audioOutput) { startAudioOutput(); }
     }
 
     void disable() {
         chain.stopRecording();
+        stopAudioOutput();
         chain.stop();
         sigpath::vfoManager.deleteVFO(vfo);
         vfo = NULL;
@@ -122,14 +134,43 @@ private:
         if (conf.contains("dbMin")) { dbMin = conf["dbMin"]; }
         if (conf.contains("dbMax")) { dbMax = conf["dbMax"]; }
         if (conf.contains("peakHold")) { peakHold = conf["peakHold"]; }
+        if (conf.contains("levelUnits")) { levelPercent = (conf["levelUnits"] == "percent"); }
         if (conf.contains("recPath")) { folderSelect.setPath(conf["recPath"]); }
         if (conf.contains("sampleType") && sampleTypes.keyExists(conf["sampleType"])) {
             sampleTypeId = sampleTypes.keyId(conf["sampleType"]);
         }
+#ifndef __ANDROID__
+        if (conf.contains("audioOutput")) { audioOutput = conf["audioOutput"]; }
+#endif
         config.release(created);
 
         bandwidth = std::clamp<double>(bandwidth, MPX_MIN_BANDWIDTH, MPX_MAX_BANDWIDTH);
         maxFreq = std::clamp<float>(maxFreq, 20.0f, MPX_SAMPLERATE / 2000.0f);
+    }
+
+    // The MPX is registered as an SDR++ audio stream named after this instance. The output device and
+    // sample rate are chosen in the Sinks menu; 192kHz passes the MPX through unchanged.
+    void startAudioOutput() {
+        if (audioRunning) { return; }
+        audioResamp.start();
+        sigpath::sinkManager.registerStream(name, &audioStream);
+        audioStream.start();
+        chain.setAudioOutput(&audioIn);
+        audioRunning = true;
+    }
+
+    void stopAudioOutput() {
+        if (!audioRunning) { return; }
+        chain.setAudioOutput(NULL);
+        sigpath::sinkManager.unregisterStream(name);
+        audioResamp.stop();
+        audioRunning = false;
+    }
+
+    // Called when the sink selects a sample rate for our stream
+    static void audioSampleRateChanged(float sampleRate, void* ctx) {
+        MPXAnalyzerModule* _this = (MPXAnalyzerModule*)ctx;
+        _this->audioResamp.setOutSamplerate(sampleRate);
     }
 
     template <class T>
@@ -312,6 +353,35 @@ private:
             _this->chain.resetPeak();
         }
 
+        // Units for deviation, pilot and RDS levels
+        int unitId = _this->levelPercent ? 1 : 0;
+        ImGui::LeftLabel("Level units");
+        ImGui::FillWidth();
+        if (ImGui::Combo(CONCAT("##_mpx_units_", _this->name), &unitId, "kHz\0% (100% = 75 kHz)\0")) {
+            _this->levelPercent = (unitId == 1);
+            _this->saveSetting("levelUnits", std::string(_this->levelPercent ? "percent" : "khz"));
+        }
+
+#ifndef __ANDROID__
+        // Audio output
+        if (ImGui::Checkbox(CONCAT("Audio output##_mpx_audio_", _this->name), &_this->audioOutput)) {
+            if (_this->audioOutput && _this->enabled) {
+                _this->startAudioOutput();
+            }
+            else {
+                _this->stopAudioOutput();
+            }
+            _this->saveSetting("audioOutput", _this->audioOutput);
+        }
+        if (_this->audioRunning) {
+            ImGui::TextWrapped("Choose the device for stream \"%s\" in the Sinks menu, at 192000 Hz.", _this->name.c_str());
+            float outRate = _this->audioStream.getSampleRate();
+            if (outRate < MPX_SAMPLERATE) {
+                ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Output is %.0f Hz: MPX above %.0f kHz is lost", outRate, outRate / 2000.0f);
+            }
+        }
+#endif
+
         // Recording
         bool recording = _this->chain.isRecording();
         if (recording) { style::beginDisabled(); }
@@ -410,6 +480,7 @@ private:
             return;
         }
 
+        ImGui::AlignTextToFramePadding();
         ImGui::Text("%.4f MHz", getFrequency() / 1e6);
         if (!followName.empty() && gui::waterfall.vfos.find(followName) != gui::waterfall.vfos.end()) {
             ImGui::SameLine();
@@ -426,83 +497,183 @@ private:
             if (ImGui::SmallButton(CONCAT("Reset##_mpx_win_peak_reset_", name))) { chain.resetPeak(); }
         }
 
-        if (chain.isRecording()) {
+        // Record button (and elapsed time while recording), right aligned
+        bool recording = chain.isRecording();
+        float btnSize = ImGui::GetFrameHeight();
+        float spacing = ImGui::GetStyle().ItemSpacing.x;
+        char timeText[32] = "";
+        if (recording) {
             uint64_t seconds = chain.getRecordedSamples() / (uint64_t)MPX_SAMPLERATE;
+            snprintf(timeText, sizeof(timeText), "REC %02d:%02d:%02d", (int)(seconds / 3600), (int)((seconds / 60) % 60), (int)(seconds % 60));
+        }
+        float groupWidth = btnSize + (recording ? ImGui::CalcTextSize(timeText).x + spacing : 0.0f);
+        float right = ImGui::GetWindowContentRegionMax().x;
+
+        // Scale reminder, only when there's room for it
+        ImGui::SameLine();
+        const char* scaleNote = "0 dB = 75 kHz dev.";
+        if (ImGui::GetCursorPosX() + ImGui::CalcTextSize(scaleNote).x + spacing <= right - groupWidth) {
+            ImGui::TextDisabled("%s", scaleNote);
             ImGui::SameLine();
-            ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f), "REC %02d:%02d:%02d", (int)(seconds / 3600), (int)((seconds / 60) % 60), (int)(seconds % 60));
         }
 
-        ImGui::SameLine();
-        ImGui::TextDisabled("0 dB = %.0f kHz dev.", MPX_DEVIATION / 1000.0);
+        ImGui::SetCursorPosX(std::max<float>(ImGui::GetCursorPosX(), right - groupWidth));
+        if (recording) {
+            ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f), "%s", timeText);
+            ImGui::SameLine();
+        }
+        drawRecordButton(btnSize, recording);
+    }
+
+    void drawRecordButton(float size, bool recording) {
+        bool canRecord = folderSelect.pathIsValid();
+        bool disabled = !recording && !canRecord;
+        ImVec2 pos = ImGui::GetCursorScreenPos();
+
+        if (disabled) { style::beginDisabled(); }
+        bool clicked = ImGui::Button(CONCAT("##_mpx_win_rec_", name), ImVec2(size, size));
+        if (disabled) { style::endDisabled(); }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("%s", recording ? "Stop recording" : (canRecord ? "Record MPX" : "Recording folder is not valid"));
+        }
+
+        // Red circle to record, red square to stop
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 center(pos.x + size * 0.5f, pos.y + size * 0.5f);
+        ImU32 col = disabled ? IM_COL32(150, 60, 60, 255) : IM_COL32(230, 40, 40, 255);
+        if (recording) {
+            float h = size * 0.25f;
+            dl->AddRectFilled(ImVec2(center.x - h, center.y - h), ImVec2(center.x + h, center.y + h), col, size * 0.05f);
+        }
+        else {
+            dl->AddCircleFilled(center, size * 0.3f, col);
+        }
+
+        if (clicked) {
+            if (recording) {
+                chain.stopRecording();
+            }
+            else {
+                startRecording();
+            }
+        }
     }
 
     float getMetersWidth() {
         ImGui::SetWindowFontScale(MPX_METER_FONT_SCALE);
         float valueWidth = ImGui::CalcTextSize("-00.0 dBr").x;
         ImGui::SetWindowFontScale(1.0f);
-        float labelWidth = ImGui::CalcTextSize("1 s: -00.0 dBr").x;
-        return std::max<float>(valueWidth, labelWidth) + 8.0f * style::uiScale;
+        float rowWidth = ImGui::CalcTextSize("Pilot  00.00 kHz").x;
+        float labelWidth = ImGui::CalcTextSize("Deviation (1 s peak)").x;
+        return std::max<float>(std::max<float>(valueWidth, rowWidth), labelWidth) + 8.0f * style::uiScale;
+    }
+
+    // Label on the left, value right aligned in the meters column
+    void meterRow(float width, const char* label, const ImVec4& col, const char* fmt, ...) {
+        char buf[64];
+        va_list args;
+        va_start(args, fmt);
+        vsnprintf(buf, sizeof(buf), fmt, args);
+        va_end(args);
+
+        // Inside a group, SameLine() offsets are relative to the group's left edge
+        ImGui::TextDisabled("%s", label);
+        ImGui::SameLine(width - ImGui::CalcTextSize(buf).x);
+        ImGui::TextColored(col, "%s", buf);
+    }
+
+    // Formats a deviation level in kHz, or in percent where 100% = 75kHz. Subcarrier levels get an extra decimal in kHz
+    static void formatLevel(char* buf, size_t len, float khz, bool percent, bool subcarrier) {
+        if (percent) {
+            snprintf(buf, len, "%.1f %%", 100.0f * khz / (MPX_DEVIATION / 1000.0f));
+        }
+        else {
+            snprintf(buf, len, subcarrier ? "%.2f kHz" : "%.1f kHz", khz);
+        }
+    }
+
+    void meterValue(const ImVec4& col, const char* text) {
+        ImGui::SetWindowFontScale(MPX_METER_FONT_SCALE);
+        ImGui::TextColored(col, "%s", text);
+        ImGui::SetWindowFontScale(1.0f);
     }
 
     void drawMeters(float width) {
         MPXMeasurements meas;
         bool valid = enabled && chain.getMeasurements(meas);
         ImVec4 normalCol = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+        ImVec4 dimCol = ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
         ImVec4 warnCol = ImVec4(1.0f, 0.65f, 0.0f, 1.0f);
         ImVec4 overCol = ImVec4(1.0f, 0.2f, 0.2f, 1.0f);
+        float maxDev = MPX_DEVIATION / 1000.0;
+        char buf[64];
 
         ImGui::BeginGroup();
-        ImGui::PushItemWidth(width);
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 2.0f * style::uiScale));
 
-        // MPX power (ITU-R BS.412)
-        ImGui::TextDisabled("MPX power");
-        ImGui::SetWindowFontScale(MPX_METER_FONT_SCALE);
-        if (valid) {
-            ImGui::TextColored((meas.powerDBr > 0.0f) ? warnCol : normalCol, "%+.1f dBr", meas.powerDBr);
+        // MPX power (ITU-R BS.412), 60s average with a 1s short term value
+        if (valid && meas.powerSeconds < 59.95f) {
+            ImGui::TextDisabled("MPX power (%.0f s)", meas.powerSeconds);
         }
         else {
-            ImGui::TextDisabled("--.- dBr");
+            ImGui::TextDisabled("MPX power (60 s)");
         }
-        ImGui::SetWindowFontScale(1.0f);
+        if (valid) { snprintf(buf, sizeof(buf), "%+.1f dBr", meas.powerDBr); }
+        meterValue(valid ? ((meas.powerDBr > 0.0f) ? warnCol : normalCol) : dimCol, valid ? buf : "--.- dBr");
         if (valid) {
-            if (meas.powerSeconds < 59.95f) {
-                ImGui::TextDisabled("%.0f s avg", meas.powerSeconds);
-            }
-            else {
-                ImGui::TextDisabled("60 s avg");
-            }
-            ImGui::TextDisabled("1 s: %+.1f dBr", meas.powerShortDBr);
+            meterRow(width, "1 s", dimCol, "%+.1f dBr", meas.powerShortDBr);
         }
         else {
-            ImGui::TextDisabled("60 s avg");
-            ImGui::TextDisabled("1 s: --.- dBr");
+            meterRow(width, "1 s", dimCol, "--.- dBr");
         }
 
         ImGui::Spacing();
+
+        // Peak deviation over 1s with max hold
+        const char* noLevel = levelPercent ? "--.- %" : "--.- kHz";
+        ImGui::TextDisabled("Deviation (1 s peak)");
+        if (valid) { formatLevel(buf, sizeof(buf), meas.peakDevKHz, levelPercent, false); }
+        meterValue(valid ? ((meas.peakDevKHz > maxDev) ? overCol : normalCol) : dimCol, valid ? buf : noLevel);
+        if (valid) {
+            formatLevel(buf, sizeof(buf), meas.maxDevKHz, levelPercent, false);
+            meterRow(width, "Max", (meas.maxDevKHz > maxDev) ? overCol : dimCol, "%s", buf);
+        }
+        else {
+            meterRow(width, "Max", dimCol, "%s", noLevel);
+        }
+
         ImGui::Spacing();
+        ImGui::Separator();
 
-        // Peak deviation
-        ImGui::TextDisabled("Deviation");
-        ImGui::SetWindowFontScale(MPX_METER_FONT_SCALE);
-        if (valid) {
-            ImGui::TextColored((meas.peakDevKHz > MPX_DEVIATION / 1000.0) ? overCol : normalCol, "%.1f kHz", meas.peakDevKHz);
+        // Subcarrier levels, with the other unit in the tooltip
+        char alt[64];
+        if (valid && meas.pilotPresent) {
+            formatLevel(buf, sizeof(buf), meas.pilotKHz, levelPercent, true);
+            meterRow(width, "Pilot", normalCol, "%s", buf);
+            if (ImGui::IsItemHovered()) {
+                formatLevel(alt, sizeof(alt), meas.pilotKHz, !levelPercent, true);
+                ImGui::SetTooltip("19 kHz pilot: %s", alt);
+            }
         }
         else {
-            ImGui::TextDisabled("--.- kHz");
+            meterRow(width, "Pilot", dimCol, "%s", valid ? "none" : noLevel);
         }
-        ImGui::SetWindowFontScale(1.0f);
-        ImGui::TextDisabled("1 s peak");
-        if (valid) {
-            ImGui::TextColored((meas.maxDevKHz > MPX_DEVIATION / 1000.0) ? overCol : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled), "Max: %.1f kHz", meas.maxDevKHz);
+        if (valid && meas.rdsPresent) {
+            formatLevel(buf, sizeof(buf), meas.rdsKHz, levelPercent, true);
+            meterRow(width, "RDS", normalCol, "%s", buf);
+            if (ImGui::IsItemHovered()) {
+                formatLevel(alt, sizeof(alt), meas.rdsKHz, !levelPercent, true);
+                ImGui::SetTooltip("57 kHz RDS: %s", alt);
+            }
         }
         else {
-            ImGui::TextDisabled("Max: --.- kHz");
+            meterRow(width, "RDS", dimCol, "%s", valid ? "none" : noLevel);
         }
 
+        ImGui::PopStyleVar();
         ImGui::Spacing();
         if (ImGui::SmallButton(CONCAT("Reset##_mpx_meas_reset_", name))) { chain.resetMeasurements(); }
 
-        ImGui::PopItemWidth();
         ImGui::EndGroup();
     }
 
@@ -638,6 +809,14 @@ private:
     VFOManager::VFO* vfo = NULL;
     MPXChain chain;
 
+    // Audio output
+    bool audioOutput = false;
+    bool audioRunning = false;
+    dsp::stream<dsp::stereo_t> audioIn;
+    dsp::multirate::RationalResampler<dsp::stereo_t> audioResamp;
+    SinkManager::Stream audioStream;
+    EventHandler<float> audioSrHandler;
+
     // Settings
     std::string followName = "Radio";
     double bandwidth = MPX_DEFAULT_BANDWIDTH;
@@ -647,6 +826,7 @@ private:
     float dbMin = -100.0f;
     float dbMax = 0.0f;
     bool peakHold = false;
+    bool levelPercent = false;
     FolderSelect folderSelect;
     OptionList<std::string, wav::SampleType> sampleTypes;
     int sampleTypeId = 0;
