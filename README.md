@@ -33,6 +33,13 @@ The Radio's WFM default bandwidth of 150 kHz is narrow for MPX work. It cuts int
   - **How:** the 57 kHz band is shifted to 0 Hz and filtered to the RDS bandwidth. RDS has almost no energy exactly at 57 kHz, while noise does, so the noise in the band is estimated and removed. The remaining RMS level is converted to peak deviation using the crest factor of a standard EN 50067 RDS signal (1.444).
   - **Result:** readings stay accurate on noisy signals, matching a peak reading on a clean one.
   - **No RDS:** shows "none" when there's no RDS, i.e. when the band holds less than twice as much RDS power as noise, or the level is below 0.3 kHz.
+- **RDS lock:** whether the RDS 57 kHz subcarrier is phase-locked to the third harmonic of the 19 kHz pilot, as EN 50067 / IEC 62106 require for stereo stations. The standard allows in phase (0°) or quadrature (90°), within ±10°.
+  - **Readings:** *Yes* with the phase offset (e.g. "Yes +2°"), green when within tolerance and amber when not. *No* (amber) means the RDS encoder isn't locked to the pilot. *n/a* means there is no pilot or no RDS.
+  - **How:** squaring the RDS signal removes its data and leaves the carrier phase. This is compared with 3× the pilot phase every 10 ms and averaged over 5 seconds.
+  - **Lock decision:** a stable difference means locked; a drifting one averages out. Even a 0.2 Hz frequency difference is detected as "No".
+  - **Hover:** the tooltip shows the exact phase and the stability figure (locked above 0.90).
+  - **180° ambiguity:** RDS's data modulation hides 180° phase steps, so the offset is shown in the range −90° to +90°.
+- **CPU use:** the spectrum and all measurements are only computed while the MPX window is open. Recording and audio output carry on when it's closed. Reopening the window restarts the measurements, so the 60 s MPX power and 5 s RDS lock windows fill up again. The analysis is light anyway, about 0.3% of one desktop CPU core. Most of the plugin's CPU use is the channel filter that extracts its 384 kHz channel from the SDR's bandwidth, which recording and audio output also need.
 - **Reset:** the measurements restart automatically when the frequency or bandwidth changes. *Reset* restarts them by hand.
 - **Accuracy:** a slow DC filter removes any carrier offset first, so slight mistuning doesn't affect the readings. The IF filter does affect them: a narrow bandwidth (e.g. the Radio's 150 kHz WFM default) distorts the MPX and changes both readings. For measurements, use a bandwidth of about 200–250 kHz on a clean signal.
 
@@ -83,7 +90,27 @@ Then build SDR++ as usual. The plugin is built and installed with the other modu
 
 ### macOS
 
-Use the standalone build and copy `mpx_analyzer.dylib` into the app bundle's `Plugins` folder, or into the configured `modulesDirectory`.
+**Pre-built (GitHub Actions):** every push builds `mpx_analyzer.dylib` for Intel (`mpx_analyzer_macos_intel`) and Apple Silicon (`mpx_analyzer_macos_arm`) Macs. The build uses the same runners, dependencies and macOS 10.15 deployment target as the official SDR++ macOS builds.
+- **Prepared for the app:** the dylib's library references point into `SDR++.app/Contents/Frameworks`, like the app's own plugins, so it doesn't need Homebrew on the user's Mac.
+- **Checked against the nightly:** the build checks that every library the plugin needs is in the current SDR++ macOS nightly, and shows a warning in the build log if not.
+- **Version match:** as on Windows, `SDRPP_VERSION.txt` shows which SDR++ commit it was built against, which must match the SDR++ you run.
+
+To install a downloaded build:
+```sh
+# Downloaded files are quarantined by macOS and would be refused when SDR++ loads them
+xattr -d com.apple.quarantine mpx_analyzer.dylib
+cp mpx_analyzer.dylib /Applications/SDR++.app/Contents/Plugins/
+```
+Then start SDR++ and add an `mpx_analyzer` instance in Module Manager. If macOS complains that SDR++ is damaged after the plugin is added, re-sign the app locally: `codesign --force --deep -s - /Applications/SDR++.app`.
+
+**Building locally:**
+```sh
+brew install cmake pkg-config fftw volk glfw zstd
+cmake -B build -DSDRPP_SOURCE_DIR="$HOME/SDRPlusPlus" -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+cp build/mpx_analyzer.dylib /Applications/SDR++.app/Contents/Plugins/
+```
+A local build links to your Homebrew libraries, so it works on your own Mac but isn't suitable for giving to others. Use the GitHub Actions build for that.
 
 ## Usage
 

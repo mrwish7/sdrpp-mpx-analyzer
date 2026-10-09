@@ -84,3 +84,57 @@ jobs:
 
         - name: Build
           run: cmake --build build -j$(nproc) --target mpx_analyzer
+
+    # Same runners, dependencies and deployment target as SDR++'s own macOS builds
+    build_macos:
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - runner: macos-15-intel
+                      arch: intel
+                    - runner: macos-15
+                      arch: arm
+        runs-on: ${{ matrix.runner }}
+
+        steps:
+        - name: Checkout plugin
+          uses: actions/checkout@v4
+          with:
+              path: plugin
+
+        - name: Checkout SDR++
+          uses: actions/checkout@v4
+          with:
+              repository: AlexandreRouma/SDRPlusPlus
+              ref: ${{ env.SDRPP_REF }}
+              path: SDRPlusPlus
+
+        - name: Install dependencies
+          run: brew install pkg-config fftw glfw zstd && pip3 install mako --break-system-packages
+
+        - name: Install volk
+          run: git clone --recursive https://github.com/gnuradio/volk && cd volk && mkdir build && cd build && cmake -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 -DCMAKE_BUILD_TYPE=Release .. && make -j3 && sudo make install
+
+        - name: Configure
+          run: cmake -S plugin -B build "-DSDRPP_SOURCE_DIR=$GITHUB_WORKSPACE/SDRPlusPlus" -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DUSE_BUNDLE_DEFAULTS=ON "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-dead_strip_dylibs"
+
+        - name: Build
+          run: cmake --build build -j3 --target mpx_analyzer
+
+        - name: Download SDR++ nightly (for the library check)
+          continue-on-error: true
+          run: curl -fL -o sdrpp_nightly.zip "https://github.com/AlexandreRouma/SDRPlusPlus/releases/download/nightly/sdrpp_macos_${{ matrix.arch }}.zip"
+
+        - name: Package
+          run: |
+            bash plugin/.github/scripts/macos_package.sh build/mpx_analyzer.dylib dist sdrpp_nightly.zip
+            cp plugin/README.md plugin/LICENSE dist/
+            echo "Built against SDR++ commit $(git -C SDRPlusPlus rev-parse HEAD) ($(git -C SDRPlusPlus log -1 --format=%cd --date=iso))" > dist/SDRPP_VERSION.txt
+            cat dist/SDRPP_VERSION.txt
+
+        - name: Upload
+          uses: actions/upload-artifact@v4
+          with:
+              name: mpx_analyzer_macos_${{ matrix.arch }}
+              path: dist/

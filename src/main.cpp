@@ -63,6 +63,7 @@ public:
         vfo = createVFO();
         chain.init(vfo->output);
         chain.setAveraging(avgFrames);
+        chain.setAnalysis(showWindow);
         chain.start();
 
         // Optional MPX output to an SDR++ sink (sound device, network...)
@@ -424,6 +425,9 @@ private:
         MPXAnalyzerModule* _this = (MPXAnalyzerModule*)ctx;
         _this->followVFO();
         _this->checkRetune();
+
+        // Only compute the spectrum and measurements while the popup is open
+        _this->chain.setAnalysis(_this->showWindow);
         _this->drawWindow();
     }
 
@@ -449,7 +453,7 @@ private:
 
         float s = style::uiScale;
         ImGui::SetNextWindowSize(ImVec2(720.0f * s, 340.0f * s), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSizeConstraints(ImVec2(440.0f * s, 280.0f * s), ImVec2(FLT_MAX, FLT_MAX));
+        ImGui::SetNextWindowSizeConstraints(ImVec2(440.0f * s, 300.0f * s), ImVec2(FLT_MAX, FLT_MAX));
 
         bool open = true;
         std::string title = "MPX Spectrum (" + name + ")###_mpx_win_" + name;
@@ -668,6 +672,32 @@ private:
         }
         else {
             meterRow(width, "RDS", dimCol, "%s", valid ? "none" : noLevel);
+        }
+
+        // RDS carrier locked to the 3rd harmonic of the pilot (only meaningful with both present)
+        if (valid && meas.pilotPresent && meas.rdsPresent && meas.lockValid) {
+            // EN 50067: in phase or quadrature, within +/-10 degrees
+            float offset = fabsf(meas.lockPhaseDeg);
+            bool inTolerance = (std::min<float>(offset, fabsf(90.0f - offset)) <= 10.0f);
+            ImVec4 goodCol = ImVec4(0.3f, 0.85f, 0.3f, 1.0f);
+            if (meas.locked) {
+                meterRow(width, "RDS lock", inTolerance ? goodCol : warnCol, "Yes %+.0f\xC2\xB0", meas.lockPhaseDeg);
+            }
+            else {
+                meterRow(width, "RDS lock", warnCol, "No");
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("RDS 57 kHz carrier vs 3rd harmonic of the 19 kHz pilot\n"
+                                  "Phase: %+.1f\xC2\xB0 (EN 50067: 0\xC2\xB0 or 90\xC2\xB0, \xC2\xB1" "10\xC2\xB0)\n"
+                                  "Stability: %.3f over %.0f s (locked above %.2f)",
+                                  meas.lockPhaseDeg, meas.lockCoherence, meas.lockSeconds, MPX_LOCK_MIN_COHERENCE);
+            }
+        }
+        else if (valid && meas.pilotPresent && meas.rdsPresent) {
+            meterRow(width, "RDS lock", dimCol, "--");
+        }
+        else {
+            meterRow(width, "RDS lock", dimCol, "%s", valid ? "n/a" : "--");
         }
 
         ImGui::PopStyleVar();

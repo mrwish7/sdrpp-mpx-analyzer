@@ -16,6 +16,7 @@
 #include <vector>
 #include <string.h>
 #include <math.h>
+#include <complex>
 
 // IQ rate delivered by the VFO. 384k decimates by exactly 2 to the 192k MPX rate
 #define MPX_IF_SAMPLERATE   384000.0
@@ -71,6 +72,12 @@
 // Peak/RMS ratio of a standard RDS signal (EN 50067 biphase symbol shaping), to report peak deviation
 #define MPX_RDS_CREST_FACTOR    1.444
 
+// RDS to pilot phase lock: the 57kHz carrier phase is compared to 3x the pilot phase every 10ms and the
+// result averaged over this many 100ms blocks. Locked when the phase difference is stable enough
+#define MPX_LOCK_BLOCKS         50      // 5s
+#define MPX_LOCK_MIN_BLOCKS     10      // Don't report before 1s of data
+#define MPX_LOCK_MIN_COHERENCE  0.9
+
 struct MPXMeasurements {
     float powerDBr;         // MPX power over the last 60s (or since reset, if shorter)
     float powerShortDBr;    // MPX power over the last 1s
@@ -81,6 +88,11 @@ struct MPXMeasurements {
     bool pilotPresent;
     float rdsKHz;           // RDS level (peak deviation, from noise corrected RMS) over the last 1s
     bool rdsPresent;
+    bool lockValid;         // Pilot and RDS both present and enough data for the lock measurement
+    bool locked;            // RDS 57kHz carrier locked to the 3rd harmonic of the pilot
+    float lockCoherence;    // 0..1, stability of the RDS/pilot phase difference
+    float lockPhaseDeg;     // RDS carrier phase relative to the 3rd pilot harmonic, -90..90 (0 = in phase, +/-90 = quadrature)
+    float lockSeconds;      // Seconds of data in the lock measurement (up to 5)
 };
 
 // FM demodulator -> 192kHz MPX -> (WAV recorder, spectrum analyzer)
@@ -134,6 +146,12 @@ public:
         rdsFir.out.free();
         rdsMix = dsp::buffer::alloc<dsp::complex_t>(MPX_RDS_CHUNK);
         rdsBase = dsp::buffer::alloc<dsp::complex_t>(MPX_RDS_CHUNK);
+
+        // Pilot at 0Hz through an identical filter, so its phase lines up exactly with the RDS samples
+        lockPilotFir.init(NULL, rdsTaps, MPX_RDS_DECIM);
+        lockPilotFir.out.free();
+        lockPilotMix = dsp::buffer::alloc<dsp::complex_t>(MPX_RDS_CHUNK);
+        lockPilotBase = dsp::buffer::alloc<dsp::complex_t>(MPX_RDS_CHUNK);
         rdsNoiseDcFraction = computeDcFraction(false);
         rdsSignalDcFraction = computeDcFraction(true);
     }
@@ -148,6 +166,8 @@ public:
         dsp::taps::free(rdsTaps);
         dsp::buffer::free(rdsMix);
         dsp::buffer::free(rdsBase);
+        dsp::buffer::free(lockPilotMix);
+        dsp::buffer::free(lockPilotBase);
     }
 
     void init(dsp::stream<dsp::complex_t>* in) {
@@ -194,6 +214,19 @@ public:
         avg = outAvg;
         peak = outPeak;
         return true;
+    }
+
+    // ---- Analysis on/off ----
+
+    // Spectrum and measurements are only needed while they're displayed. Recording and audio output
+    // are not affected. Called from the GUI thread
+    void setAnalysis(bool enable) {
+        if (enable && !analysisOn) {
+            // Start fresh rather than mixing in data from before the pause
+            measReset = true;
+            spectrumReset = true;
+        }
+        analysisOn = enable;
     }
 
     // ---- Measurements ----
@@ -265,8 +298,10 @@ private:
         MPXChain* _this = (MPXChain*)ctx;
         _this->record(data, count);
         _this->output(data, count);
-        _this->analyze(data, count);
-        _this->measure(data, count);
+        if (_this->analysisOn) {
+            _this->analyze(data, count);
+            _this->measure(data, count);
+        }
     }
 
     void output(float* data, int count) {
@@ -296,6 +331,11 @@ private:
             rdsSubCount = 0;
             rdsDcPow = rdsTotPow = 0.0;
             rdsSubBlocks = 0;
+            lockPilotSum = lockRdsSqSum = 0.0;
+            lockVec = 0.0;
+            lockWeight = 0.0;
+            lockPos = 0;
+            lockFill = 0;
             std::lock_guard<std::mutex> lck(measMtx);
             measValid = false;
         }
@@ -366,17 +406,24 @@ private:
         for (int off = 0; off < count; off += MPX_RDS_CHUNK) {
             int n = std::min<int>(MPX_RDS_CHUNK, count - off);
 
-            // Shift 57kHz to 0Hz, then filter and decimate
+            // Shift 57kHz (and the pilot, for the lock check) to 0Hz, then filter and decimate
             for (int i = 0; i < n; i++) {
                 float x = data[off + i];
                 rdsMix[i] = { x * rdsCos[rdsPos], -x * rdsSin[rdsPos] };
+                lockPilotMix[i] = { x * pilotCos[rdsPos], -x * pilotSin[rdsPos] };
                 rdsPos = (rdsPos + 1) % MPX_TONE_TABLE;
             }
             int outCount = rdsFir.process(n, rdsMix, rdsBase);
+            lockPilotFir.process(n, lockPilotMix, lockPilotBase);
 
             for (int i = 0; i < outCount; i++) {
                 dsp::complex_t z = rdsBase[i];
                 float pow = (z.re * z.re) + (z.im * z.im);
+
+                // Squaring removes the BPSK data, leaving twice the 57kHz carrier phase
+                std::complex<double> zc(z.re, z.im);
+                lockRdsSqSum += zc * zc;
+                lockPilotSum += std::complex<double>(lockPilotBase[i].re, lockPilotBase[i].im);
 
                 // Power close to 57kHz (10ms means) vs total power, to tell RDS from noise
                 rdsSubSum.re += z.re;
@@ -388,6 +435,17 @@ private:
                     rdsDcPow += (mre * mre) + (mim * mim);
                     rdsTotPow += rdsSubPow / MPX_RDS_SUB_BLOCK;
                     rdsSubBlocks++;
+
+                    // Phase of (RDS carrier)^2 relative to (3rd pilot harmonic)^2 = 6x pilot phase,
+                    // weighted by the RDS strength in this 10ms
+                    double pilotMag = std::abs(lockPilotSum);
+                    if (pilotMag > 0.0) {
+                        std::complex<double> u = lockPilotSum / pilotMag;
+                        std::complex<double> u3 = u * u * u;
+                        lockVec += lockRdsSqSum * std::conj(u3 * u3);
+                        lockWeight += std::abs(lockRdsSqSum);
+                    }
+                    lockPilotSum = lockRdsSqSum = 0.0;
                     rdsSubSum = { 0.0f, 0.0f };
                     rdsSubPow = 0.0;
                     rdsSubCount = 0;
@@ -406,6 +464,10 @@ private:
         float pilotAmp = pilotAmpCount ? (pilotAmpSum / pilotAmpCount) : 0.0f;
         pilotAmpSum = 0.0;
         pilotAmpCount = 0;
+        std::complex<double> blkLockVec = lockVec;
+        double blkLockWeight = lockWeight;
+        lockVec = 0.0;
+        lockWeight = 0.0;
         double rdsDc = rdsSubBlocks ? (rdsDcPow / rdsSubBlocks) : 0.0;
         double rdsTot = rdsSubBlocks ? (rdsTotPow / rdsSubBlocks) : 0.0;
         rdsDcPow = rdsTotPow = 0.0;
@@ -426,6 +488,11 @@ private:
         rdsDcRing[peakPos] = rdsDc;
         rdsTotRing[peakPos] = rdsTot;
         peakPos = (peakPos + 1) % MPX_PEAK_BLOCKS;
+
+        lockVecRing[lockPos] = blkLockVec;
+        lockWeightRing[lockPos] = blkLockWeight;
+        lockPos = (lockPos + 1) % MPX_LOCK_BLOCKS;
+        lockFill = std::min<int>(lockFill + 1, MPX_LOCK_BLOCKS);
         peakFill = std::min<int>(peakFill + 1, MPX_PEAK_BLOCKS);
         maxPeak = std::max<float>(maxPeak, peak);
 
@@ -465,6 +532,24 @@ private:
         meas.rdsKHz = 2.0 * sqrt(rdsSignal) * MPX_RDS_CREST_FACTOR * (MPX_DEVIATION / 1000.0);
         meas.rdsPresent = (meas.rdsKHz >= MPX_RDS_MIN_KHZ) && (rdsSignal >= MPX_RDS_MIN_SNR * rdsNoise);
 
+        // Lock: a stable phase difference gives a long average vector, a drifting one averages out
+        std::complex<double> lockSum = 0.0;
+        double lockWeightSum = 0.0;
+        for (int k = 0; k < lockFill; k++) {
+            lockSum += lockVecRing[k];
+            lockWeightSum += lockWeightRing[k];
+        }
+        meas.lockSeconds = (lockFill * MPX_METER_BLOCK) / MPX_SAMPLERATE;
+        meas.lockCoherence = (lockWeightSum > 0.0) ? (std::abs(lockSum) / lockWeightSum) : 0.0f;
+        meas.lockValid = meas.pilotPresent && meas.rdsPresent && (lockFill >= MPX_LOCK_MIN_BLOCKS);
+        meas.locked = meas.lockValid && (meas.lockCoherence >= MPX_LOCK_MIN_COHERENCE);
+
+        // Halve the doubled phase. BPSK leaves a 180 degree ambiguity, so fold into -90..90
+        double phase = (std::arg(lockSum) / 2.0) * (180.0 / FL_M_PI);
+        if (phase >= 90.0) { phase -= 180.0; }
+        if (phase < -90.0) { phase += 180.0; }
+        meas.lockPhaseDeg = phase;
+
         std::lock_guard<std::mutex> lck(measMtx);
         measOut = meas;
         measValid = true;
@@ -491,6 +576,11 @@ private:
     }
 
     void analyze(float* data, int count) {
+        if (spectrumReset.exchange(false)) {
+            framePos = 0;
+            firstFrame = true;
+        }
+
         while (count > 0) {
             int n = std::min<int>(count, MPX_FFT_SIZE - framePos);
             memcpy(&frame[framePos], data, n * sizeof(float));
@@ -558,6 +648,8 @@ private:
     bool firstFrame = true;
     std::atomic<float> avgAlpha = 0.1f;
     std::atomic<bool> peakReset = false;
+    std::atomic<bool> spectrumReset = false;
+    std::atomic<bool> analysisOn = true;
 
     // Measurements (DSP thread only)
     float dcEst = 0.0f;
@@ -600,6 +692,19 @@ private:
     int rdsSubBlocks = 0;
     double rdsNoiseDcFraction;
     double rdsSignalDcFraction;
+
+    // RDS to pilot phase lock (DSP thread only)
+    dsp::filter::DecimatingFIR<dsp::complex_t, float> lockPilotFir;
+    dsp::complex_t* lockPilotMix;
+    dsp::complex_t* lockPilotBase;
+    std::complex<double> lockPilotSum = 0.0;
+    std::complex<double> lockRdsSqSum = 0.0;
+    std::complex<double> lockVec = 0.0;
+    double lockWeight = 0.0;
+    std::complex<double> lockVecRing[MPX_LOCK_BLOCKS];
+    double lockWeightRing[MPX_LOCK_BLOCKS];
+    int lockPos = 0;
+    int lockFill = 0;
     double rdsDcRing[MPX_PEAK_BLOCKS];
     double rdsTotRing[MPX_PEAK_BLOCKS];
 
