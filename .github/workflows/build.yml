@@ -138,3 +138,54 @@ jobs:
           with:
               name: mpx_analyzer_macos_${{ matrix.arch }}
               path: dist/
+
+    # Pushing a version tag (e.g. v0.2.0) publishes the builds as a GitHub Release
+    release:
+        if: startsWith(github.ref, 'refs/tags/v')
+        needs: [build_windows, build_linux, build_macos]
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+
+        steps:
+        - name: Download builds
+          uses: actions/download-artifact@v4
+          with:
+              path: artifacts
+
+        - name: Zip builds
+          run: |
+            mkdir release
+            for DIR in artifacts/mpx_analyzer_*; do
+                NAME=$(basename "$DIR")
+                (cd "$DIR" && zip -r "$GITHUB_WORKSPACE/release/${NAME}_${GITHUB_REF_NAME}.zip" .)
+            done
+            ls -l release
+
+        - name: Write release notes
+          run: |
+            SDRPP=$(cat artifacts/mpx_analyzer_windows_x64/SDRPP_VERSION.txt | tr -d '\r\n' | sed 's/^\xEF\xBB\xBF//')
+            cat > notes.md << EOF
+            **${SDRPP}.** The plugin must be used with a matching SDR++ build, e.g. an SDR++ nightly from around the same date.
+
+            | Download | Platform | Install |
+            |---|---|---|
+            | \`mpx_analyzer_windows_x64_${GITHUB_REF_NAME}.zip\` | Windows 64-bit | Copy \`mpx_analyzer.dll\` into SDR++'s \`modules\` folder |
+            | \`mpx_analyzer_macos_arm_${GITHUB_REF_NAME}.zip\` | Mac, Apple Silicon | \`xattr -d com.apple.quarantine mpx_analyzer.dylib\`, then copy it to \`/Applications/SDR++.app/Contents/Plugins/\` |
+            | \`mpx_analyzer_macos_intel_${GITHUB_REF_NAME}.zip\` | Mac, Intel | As above |
+
+            Linux: build from source, see the README. Then start SDR++ and add an \`mpx_analyzer\` instance in Module Manager.
+            EOF
+            sed -i 's/^ *//' notes.md
+            cat notes.md
+
+        - name: Publish release
+          env:
+              GH_TOKEN: ${{ github.token }}
+          run: |
+            # Update the release if one already exists for this tag (e.g. created on the website first)
+            if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+                gh release upload "$GITHUB_REF_NAME" release/*.zip --clobber --repo "$GITHUB_REPOSITORY"
+            else
+                gh release create "$GITHUB_REF_NAME" release/*.zip --repo "$GITHUB_REPOSITORY" --title "MPX Analyzer $GITHUB_REF_NAME" --notes-file notes.md
+            fi
