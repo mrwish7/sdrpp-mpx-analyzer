@@ -7,7 +7,7 @@ An [SDR++](https://github.com/AlexandreRouma/SDRPlusPlus) plugin for broadcast F
 
 ## How it works
 
-The plugin creates its own VFO (384 kS/s IQ, 250 kHz IF bandwidth by default) and FM-demodulates it with SDR++'s quadrature demodulator. It then decimates the result by 2 to 192 kHz. That 192 kHz signal feeds two places:
+The plugin creates its own VFO (384 kS/s IQ, 250 kHz IF bandwidth by default) and FM-demodulates it with SDR++'s quadrature demodulator. It then decimates the result by 2 to 192 kHz. The decimation filter also corrects the demodulator's high-frequency roll-off (it measures the phase change over one 384 kHz sample, which would otherwise read 0.4% low at 19 kHz and 3.6% low at 57 kHz), so the MPX is flat within 0.01% up to about 76 kHz. That 192 kHz signal feeds two places:
 
 - the spectrum display (4096-point FFT, Blackman-Harris window, 50% overlap)
 - the WAV recorder

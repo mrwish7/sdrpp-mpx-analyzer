@@ -5,6 +5,8 @@
 #include <dsp/sink/handler_sink.h>
 #include <dsp/window/blackman_harris.h>
 #include <dsp/window/hann.h>
+#include <dsp/window/nuttall.h>
+#include <dsp/taps/estimate_tap_count.h>
 #include <dsp/buffer/buffer.h>
 #include <utils/wav.h>
 #include <utils/flog.h>
@@ -119,11 +121,7 @@ public:
         fftOut = (fftwf_complex*)fftwf_malloc(MPX_FFT_BINS * sizeof(fftwf_complex));
         plan = fftwf_plan_dft_r2c_1d(MPX_FFT_SIZE, fftIn, fftOut, FFTW_ESTIMATE);
 
-        // Decimation filter, normalized to exactly unity gain
-        decimTaps = dsp::taps::lowPass(MPX_DECIM_CUTOFF, MPX_DECIM_TRANS, MPX_IF_SAMPLERATE, true);
-        double tapSum = 0.0;
-        for (int i = 0; i < decimTaps.size; i++) { tapSum += decimTaps.taps[i]; }
-        for (int i = 0; i < decimTaps.size; i++) { decimTaps.taps[i] /= tapSum; }
+        decimTaps = designDecimTaps();
 
         // Subcarrier reference tables
         for (int i = 0; i < MPX_TONE_TABLE; i++) {
@@ -168,6 +166,34 @@ public:
         dsp::buffer::free(rdsBase);
         dsp::buffer::free(lockPilotMix);
         dsp::buffer::free(lockPilotBase);
+    }
+
+    // Low pass for the /2 decimation that also corrects the quadrature demodulator's droop. The demodulator
+    // measures the phase change over one sample, i.e. the average frequency over 1/384000 s, which scales
+    // modulation at frequency f by sinc(f / 384kHz): -0.4% at 19kHz, -3.6% at 57kHz. The passband is
+    // shaped by the inverse of that (windowed frequency sampling design), and normalized to unity at DC
+    static dsp::tap<float> designDecimTaps() {
+        int count = dsp::taps::estimateTapCount(MPX_DECIM_TRANS, MPX_IF_SAMPLERATE);
+        if (!(count % 2)) { count++; }
+        dsp::tap<float> taps = dsp::taps::alloc<float>(count);
+
+        const int steps = 4000;
+        const double df = MPX_DECIM_CUTOFF / steps;
+        const double half = (count - 1) / 2.0;
+        double sum = 0.0;
+        for (int n = 0; n < count; n++) {
+            double t = n - half;
+            double acc = 0.0;
+            for (int k = 0; k < steps; k++) {
+                double f = (k + 0.5) * df;
+                double x = FL_M_PI * f / MPX_IF_SAMPLERATE;
+                acc += (x / sin(x)) * cos(2.0 * FL_M_PI * f * t / MPX_IF_SAMPLERATE);
+            }
+            taps.taps[n] = (2.0 * acc * df / MPX_IF_SAMPLERATE) * dsp::window::nuttall(n, count - 1);
+            sum += taps.taps[n];
+        }
+        for (int n = 0; n < count; n++) { taps.taps[n] /= sum; }
+        return taps;
     }
 
     void init(dsp::stream<dsp::complex_t>* in) {
