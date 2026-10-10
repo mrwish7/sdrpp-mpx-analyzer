@@ -30,7 +30,7 @@ The Radio's WFM default bandwidth of 150 kHz is narrow for MPX work. It cuts int
   - **How:** the MPX is correlated with a 19 kHz reference over 10 ms windows, so stereo audio and noise hardly affect it.
   - **No pilot:** shows "none" below 0.5 kHz, e.g. on mono stations.
 - **RDS (kHz):** the RDS injection level as peak deviation, averaged over 1 second. Typical values are 2–4 kHz; hover over it to see it as a percentage.
-  - **How:** the 57 kHz band is shifted to 0 Hz and filtered to the RDS bandwidth. RDS has almost no energy exactly at 57 kHz, while noise does, so the noise in the band is estimated and removed. The remaining RMS level is converted to peak deviation using the crest factor of a standard EN 50067 RDS signal (1.444).
+  - **How:** the 57 kHz band is shifted to 0 Hz and filtered to the RDS bandwidth. RDS has almost no energy exactly at 57 kHz, while noise does, so the noise in the band is estimated and removed. The remaining RMS level is converted to peak deviation with a crest factor of 1.51. That's the value real encoders show against reference instruments: a calibrated transmitter measured with MPX Tool, and a Pira P175-calibrated receiver across 21 stations, agree within 0.5%. The theoretical EN 50067 waveform would give 1.444, about 4.5% lower.
   - **Result:** readings stay accurate on noisy signals, matching a peak reading on a clean one.
   - **No RDS:** shows "none" when there's no RDS, i.e. when the band holds less than twice as much RDS power as noise, or the level is below 0.3 kHz.
 - **RDS lock:** whether the RDS 57 kHz subcarrier is phase-locked to the third harmonic of the 19 kHz pilot, as EN 50067 / IEC 62106 require for stereo stations. The standard allows in phase (0°) or quadrature (90°), within ±10°.
@@ -143,6 +143,39 @@ SDR++ remembers the device and rate selection for the stream. The option isn't a
 | Level units | Show deviation, pilot and RDS levels in kHz (default) or percent, where 100% = 75 kHz. Hover over Pilot/RDS to see the other unit |
 | Sample type | Int16 (default) / Int32 / Float32 WAV samples |
 | Audio output | Send the MPX to an SDR++ sink (sound device / network), configured in the Sinks menu. Off by default; not on Android |
+
+## Calibration test bench (HackRF)
+
+`tools/mpx_testgen.py` generates FM broadcast test signals with exactly known levels, for checking the plugin end to end with a HackRF looped back into a receiver (e.g. an RTL-SDR). It writes a seamlessly looping 8-bit IQ file and can play it with `hackrf_transfer`. It needs Python 3, numpy and `hackrf-tools`.
+
+**Safety first:**
+- **Coax only:** connect the HackRF to the receiver by coax through **30–40 dB of fixed attenuation**. An RTL-SDR can be damaged above about +10 dBm.
+- **Low output:** keep the HackRF's TX amplifier off (the script uses `-a 0`) and its TX gain low (`--txvga 0..10`).
+- **Don't radiate:** nothing should be transmitted over the air. Follow your local regulations.
+
+The deviation of the generated signal is exact by construction. The only error is the HackRF's clock, about 0.002%. The FM is generated with continuous phase, like a real transmitter, so a loopback test is realistic.
+
+```sh
+# Pilot only at 10%, on 100.0 MHz (receiver/plugin tuned to 100.3 MHz)
+python3 tools/mpx_testgen.py --pilot 10 --out pilot10.cs8 --tx 100.0e6
+# Tones: 1 kHz at 50% plus 57 kHz at 5%
+python3 tools/mpx_testgen.py --tone 1000:50 --tone 57000:5 --out tones.cs8 --tx 100.0e6
+# Stereo station: L 400 Hz / R 1.5 kHz at 40%, pilot 9%, RDS 4% at +30 deg to the pilot
+python3 tools/mpx_testgen.py --left 400:40 --right 1500:40 --pilot 9 --rds 4 --rds-phase 30 --out station.cs8 --tx 100.0e6
+# Unlocked RDS (0.5 Hz off), and a Bessel null check (carrier vanishes at 31.185 kHz, 100%)
+python3 tools/mpx_testgen.py --pilot 9 --rds 4 --rds-offset 0.5 --out unlocked.cs8 --tx 100.0e6
+python3 tools/mpx_testgen.py --tone 31185:100 --out bessel.cs8 --tx 100.0e6
+```
+
+**What to expect:**
+- **Pilot, tones and MPX power:** within about 0.5%. The generator prints the expected peak deviation and MPX power for each signal.
+- **RDS:** about 4.6% above the `--rds` setting. The generator uses the theoretical EN 50067 waveform, while the plugin's RDS reading follows real encoders and reference instruments (see Measurements).
+- **Deviation:** reads a little high, because the receiver's noise and the 8-bit IQ add to the true sample peak.
+
+**SDR++ VFO ripple correction:**
+- **The problem:** this bench found that SDR++'s own channel resampler has up to about 0.45 dB of passband ripple, depending on the SDR sample rate. On a low-deviation signal that alone read a 10% pilot as 9.55%.
+- **The fix:** the plugin measures this response by passing a comb of tones through a private copy of SDR++'s resampler, and cancels it with an equalising filter before the demodulator. This happens whenever the sample rate or decimation changes.
+- **In the menu:** the correction applied is shown as "VFO ripple corrected: x.xx dB".
 
 ## License
 

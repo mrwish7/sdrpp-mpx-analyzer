@@ -220,6 +220,30 @@ private:
         }
     }
 
+    // Re-measure SDR++'s VFO response and rebuild the equalizer when the IQ sample rate changes
+    void updateEqualizer() {
+        if (!enabled) { return; }
+        double rate = sigpath::iqFrontEnd.getSampleRate();
+        if (rate <= 0.0 || rate == eqRate) { return; }
+
+        int frontDecim = 1;
+        core::configManager.acquire();
+        if (core::configManager.conf.contains("decimation") && core::configManager.conf["decimation"].is_number()) {
+            frontDecim = std::max<int>(1, core::configManager.conf["decimation"]);
+        }
+        core::configManager.release();
+
+        std::vector<double> resp = MPXChain::measureVfoResponse(rate, frontDecim);
+        chain.setEqualizer(MPXChain::designEqualizer(resp));
+        eqRate = rate;
+
+        eqRippleDb = 0.0f;
+        for (size_t k = 0; k < resp.size() && k * MPX_EQ_PROBE_STEP <= MPX_EQ_MAX_FREQ; k++) {
+            eqRippleDb = std::max<float>(eqRippleDb, fabsf(20.0f * log10f(resp[k])));
+        }
+        flog::info("MPX Analyzer: corrected up to {0:.2f} dB of SDR++ VFO ripple at {1:.0f} S/s (decimation {2})", eqRippleDb, rate, frontDecim);
+    }
+
     // Measurements from a different station or filter setting shouldn't be mixed
     void checkRetune() {
         if (!enabled || !vfo) { return; }
@@ -311,6 +335,13 @@ private:
 
         if (_this->enabled && sigpath::iqFrontEnd.getSampleRate() < MPX_IF_SAMPLERATE) {
             ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Source sample rate is below 384 kS/s");
+        }
+        if (_this->enabled && _this->eqRate > 0.0) {
+            ImGui::TextDisabled("VFO ripple corrected: %.2f dB", _this->eqRippleDb);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("SDR++'s channel resampler has a small passband ripple at this sample rate.\n"
+                                  "It is measured and corrected so levels read accurately.");
+            }
         }
 
         // Display
@@ -424,6 +455,7 @@ private:
     static void fftRedraw(ImGui::WaterFall::FFTRedrawArgs args, void* ctx) {
         MPXAnalyzerModule* _this = (MPXAnalyzerModule*)ctx;
         _this->followVFO();
+        _this->updateEqualizer();
         _this->checkRetune();
 
         // Only compute the spectrum and measurements while the popup is open
@@ -873,6 +905,8 @@ private:
     bool mouseCaptured = false;
     double measFreq = 0.0;
     double measBandwidth = 0.0;
+    double eqRate = 0.0;
+    float eqRippleDb = 0.0f;
 
     EventHandler<ImGui::WaterFall::FFTRedrawArgs> fftRedrawHandler;
     EventHandler<ImGui::WaterFall::InputHandlerArgs> inputHandler;

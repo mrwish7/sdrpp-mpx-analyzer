@@ -6,6 +6,10 @@
 #include <dsp/window/blackman_harris.h>
 #include <dsp/window/hann.h>
 #include <dsp/window/nuttall.h>
+#include <dsp/window/blackman.h>
+#include <dsp/channel/rx_vfo.h>
+#include <dsp/multirate/power_decimator.h>
+#include <dsp/filter/fir.h>
 #include <dsp/taps/estimate_tap_count.h>
 #include <dsp/buffer/buffer.h>
 #include <utils/wav.h>
@@ -30,6 +34,13 @@
 // Anti-alias filter for the /2 decimation. Windowed sinc so the passband is flat for level measurements
 #define MPX_DECIM_CUTOFF    91000.0
 #define MPX_DECIM_TRANS     10000.0
+
+// VFO equalizer: probe tones every 2kHz to +/-160kHz, corrected up to 150kHz (the FM signal's extent)
+#define MPX_EQ_PROBE_STEP   2000.0
+#define MPX_EQ_PROBE_TONES  80
+#define MPX_EQ_PROBE_LEN    3072    // Output samples analysed (tones fall exactly on bins)
+#define MPX_EQ_MAX_FREQ     150000.0
+#define MPX_EQ_TAPS         401
 
 #define MPX_FFT_SIZE        4096
 #define MPX_FFT_BINS        ((MPX_FFT_SIZE / 2) + 1)
@@ -71,8 +82,10 @@
 // estimated from the power of 10ms means (~ +/-50Hz around 57kHz), see computeNoiseDcFraction()
 // RDS is considered present when its power is at least this many times the noise power in its band
 #define MPX_RDS_MIN_SNR         2.0
-// Peak/RMS ratio of a standard RDS signal (EN 50067 biphase symbol shaping), to report peak deviation
-#define MPX_RDS_CREST_FACTOR    1.444
+// Peak/RMS ratio used to report the RDS level as peak deviation. The theoretical EN 50067 waveform gives
+// 1.444, but real encoders and reference instruments read ~4.5% higher: a calibrated transmitter checked
+// with MPX Tool implies 1.51-1.52, and a Pira P175-calibrated receiver (VibeSDR, 21 UK stations) 1.507
+#define MPX_RDS_CREST_FACTOR    1.51
 
 // RDS to pilot phase lock: the 57kHz carrier phase is compared to 3x the pilot phase every 10ms and the
 // result averaged over this many 100ms blocks. Locked when the phase difference is stable enough
@@ -161,6 +174,7 @@ public:
         fftwf_free(fftIn);
         fftwf_free(fftOut);
         dsp::taps::free(decimTaps);
+        dsp::taps::free(eqTaps);
         dsp::taps::free(rdsTaps);
         dsp::buffer::free(rdsMix);
         dsp::buffer::free(rdsBase);
@@ -196,18 +210,159 @@ public:
         return taps;
     }
 
+    // ---- VFO equalizer ----
+    //
+    // SDR++'s VFO resampler (and front end decimator) has up to ~0.4dB of passband ripple, depending on
+    // the SDR sample rate. FM sidebands are scaled by it, so e.g. a -0.4dB dip at +/-19kHz reads a pilot
+    // 4.5% low. The response is measured by passing a comb of tones through a private copy of the same
+    // SDR++ blocks, and the IQ is filtered by its inverse before the demodulator.
+
+    // Measures the gain of SDR++'s IQ path (front end decimation + VFO resampling to 384kHz) at
+    // k * MPX_EQ_PROBE_STEP Hz from the channel centre, relative to the centre. Returns +/- pairs averaged
+    static std::vector<double> measureVfoResponse(double vfoInRate, int frontDecim) {
+        const int tones = MPX_EQ_PROBE_TONES;
+        const double rawRate = vfoInRate * frontDecim;
+
+        dsp::multirate::PowerDecimator<dsp::complex_t> front;
+        if (frontDecim > 1) { front.init(NULL, frontDecim); front.out.free(); }
+        dsp::channel::RxVFO vfo;
+        vfo.init(NULL, vfoInRate, MPX_IF_SAMPLERATE, MPX_IF_SAMPLERATE, 0.0);
+        vfo.out.free();
+
+        // Comb of equal tones with fixed pseudo random phases
+        std::vector<double> toneFreq, tonePhase;
+        uint32_t lcg = 12345;
+        for (int k = -tones; k <= tones; k++) {
+            toneFreq.push_back(k * MPX_EQ_PROBE_STEP);
+            lcg = lcg * 1664525u + 1013904223u;
+            tonePhase.push_back(2.0 * FL_M_PI * (lcg / 4294967296.0));
+        }
+
+        // The comb repeats every 1/MPX_EQ_PROBE_STEP seconds: compute one period when that is a whole
+        // number of samples (all usual SDR rates), otherwise rotate one phasor per tone
+        double amp = 1.0 / (2 * tones + 1);
+        double periodExact = rawRate / MPX_EQ_PROBE_STEP;
+        bool usePeriod = fabs(periodExact - round(periodExact)) < 1e-6;
+        std::vector<dsp::complex_t> period;
+        std::vector<std::complex<double>> phasor, step;
+        if (usePeriod) {
+            period.resize((size_t)round(periodExact));
+            for (size_t i = 0; i < period.size(); i++) {
+                double t = i / rawRate, re = 0.0, im = 0.0;
+                for (size_t k = 0; k < toneFreq.size(); k++) {
+                    double ph = 2.0 * FL_M_PI * toneFreq[k] * t + tonePhase[k];
+                    re += cos(ph);
+                    im += sin(ph);
+                }
+                period[i] = { (float)(re * amp), (float)(im * amp) };
+            }
+        }
+        else {
+            for (size_t k = 0; k < toneFreq.size(); k++) {
+                phasor.push_back(std::polar(1.0, tonePhase[k]));
+                step.push_back(std::polar(1.0, 2.0 * FL_M_PI * toneFreq[k] / rawRate));
+            }
+        }
+
+        // Run long enough for every filter to settle, keep the last MPX_EQ_PROBE_LEN output samples
+        const int chunk = 65536;
+        long rawCount = (long)(rawRate * 0.25);
+        std::vector<dsp::complex_t> in(chunk), mid(chunk), out(chunk);
+        std::vector<dsp::complex_t> tail;
+        for (long pos = 0; pos < rawCount; pos += chunk) {
+            int n = (int)std::min<long>(chunk, rawCount - pos);
+            for (int i = 0; i < n; i++) {
+                if (usePeriod) {
+                    in[i] = period[(pos + i) % period.size()];
+                    continue;
+                }
+                std::complex<double> s = 0.0;
+                for (size_t k = 0; k < phasor.size(); k++) {
+                    s += phasor[k];
+                    phasor[k] *= step[k];
+                }
+                in[i] = { (float)(s.real() * amp), (float)(s.imag() * amp) };
+            }
+            int m = n;
+            dsp::complex_t* vin = in.data();
+            if (frontDecim > 1) { m = front.process(n, in.data(), mid.data()); vin = mid.data(); }
+            int outCount = vfo.process(m, vin, out.data());
+            tail.insert(tail.end(), out.begin(), out.begin() + outCount);
+            if ((int)tail.size() > 4 * MPX_EQ_PROBE_LEN) { tail.erase(tail.begin(), tail.end() - MPX_EQ_PROBE_LEN); }
+        }
+        if ((int)tail.size() > MPX_EQ_PROBE_LEN) { tail.erase(tail.begin(), tail.end() - MPX_EQ_PROBE_LEN); }
+
+        // Amplitude of every tone in the output (tones sit exactly on DFT bins of the window)
+        std::vector<double> gain(toneFreq.size());
+        for (size_t k = 0; k < toneFreq.size(); k++) {
+            double re = 0.0, im = 0.0;
+            for (size_t i = 0; i < tail.size(); i++) {
+                double ph = -2.0 * FL_M_PI * toneFreq[k] * i / MPX_IF_SAMPLERATE;
+                re += tail[i].re * cos(ph) - tail[i].im * sin(ph);
+                im += tail[i].re * sin(ph) + tail[i].im * cos(ph);
+            }
+            gain[k] = sqrt(re * re + im * im) / (tail.size() * amp);
+        }
+
+        // Average +f and -f, relative to the centre
+        std::vector<double> resp(tones + 1);
+        for (int k = 0; k <= tones; k++) { resp[k] = 0.5 * (gain[tones + k] + gain[tones - k]) / gain[tones]; }
+        return resp;
+    }
+
+    // Linear phase FIR (real taps, for the complex IQ) with the inverse of a measured response
+    static dsp::tap<float> designEqualizer(const std::vector<double>& resp) {
+        const int count = MPX_EQ_TAPS;
+        const double half = (count - 1) / 2.0;
+        auto inverseAt = [&](double f) {
+            double x = std::min<double>(fabs(f), MPX_EQ_MAX_FREQ) / MPX_EQ_PROBE_STEP;
+            int i = std::min<int>((int)x, (int)resp.size() - 2);
+            double g = resp[i] + (resp[i + 1] - resp[i]) * (x - i);
+            return 1.0 / std::max<double>(g, 0.1);
+        };
+
+        dsp::tap<float> taps = dsp::taps::alloc<float>(count);
+        const int steps = 1536;                         // 125Hz grid up to fs/2
+        const double df = (MPX_IF_SAMPLERATE / 2.0) / steps;
+        double sum = 0.0;
+        for (int n = 0; n < count; n++) {
+            double t = n - half;
+            double acc = inverseAt(0.0);
+            for (int k = 1; k < steps; k++) {
+                double f = k * df;
+                acc += 2.0 * inverseAt(f) * cos(2.0 * FL_M_PI * f * t / MPX_IF_SAMPLERATE);
+            }
+            taps.taps[n] = (acc * df / MPX_IF_SAMPLERATE) * dsp::window::blackman(n, count - 1);
+            sum += taps.taps[n];
+        }
+        for (int n = 0; n < count; n++) { taps.taps[n] /= sum; }
+        return taps;
+    }
+
+    // Replaces the equalizer (GUI thread). The chain starts with a pass-through
+    void setEqualizer(dsp::tap<float> taps) {
+        dsp::tap<float> old = eqTaps;
+        eqTaps = taps;
+        eq.setTaps(eqTaps);
+        dsp::taps::free(old);
+    }
+
     void init(dsp::stream<dsp::complex_t>* in) {
-        demod.init(in, MPX_DEVIATION, MPX_IF_SAMPLERATE);
+        eqTaps = dsp::taps::alloc<float>(1);
+        eqTaps.taps[0] = 1.0f;
+        eq.init(in, eqTaps);
+        demod.init(&eq.out, MPX_DEVIATION, MPX_IF_SAMPLERATE);
         decim.init(&demod.out, decimTaps, (int)(MPX_IF_SAMPLERATE / MPX_SAMPLERATE));
         sink.init(&decim.out, handler, this);
     }
 
     void setInput(dsp::stream<dsp::complex_t>* in) {
-        demod.setInput(in);
+        eq.setInput(in);
     }
 
     void start() {
         if (running) { return; }
+        eq.start();
         demod.start();
         decim.start();
         sink.start();
@@ -216,6 +371,7 @@ public:
 
     void stop() {
         if (!running) { return; }
+        eq.stop();
         demod.stop();
         decim.stop();
         sink.stop();
@@ -643,6 +799,8 @@ private:
     }
 
     // DSP
+    dsp::tap<float> eqTaps;
+    dsp::filter::FIR<dsp::complex_t, float> eq;
     dsp::demod::Quadrature demod;
     dsp::tap<float> decimTaps;
     dsp::filter::DecimatingFIR<float, float> decim;
