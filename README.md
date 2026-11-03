@@ -24,15 +24,31 @@ The Radio's WFM default bandwidth of 150 kHz is narrow for MPX work. It cuts int
   - **Main reading:** the RMS over a sliding 60-second window, as BS.412 specifies. For the first minute after tuning it shows the average so far, with the time covered (e.g. "12 s avg").
   - **Short-term reading:** a 1-second value is shown underneath for spotting changes quickly.
   - **Highlight:** the reading turns amber above 0 dBr, the most common limit. Some regulators allow +3 or +6 dBr.
-- **Deviation (kHz):** the peak frequency deviation over the last second, plus a max hold. Both turn red above ±75 kHz.
-  - **What "peak" means here:** this is the true sample peak of the demodulated signal, so noise on weak signals pushes it up. Professional modulation meters may apply extra filtering or a peak-counting rule, so expect small differences from them.
+- **Deviation (kHz):** the peak frequency deviation over the last second, plus a max hold of the highest 1-second reading. Both turn red above ±75 kHz.
+  - **How it's measured:** like a Pira analyser, the plugin takes the peak of each 50 ms window. The 1-second reading is the **second-highest** of the last 20 windows. A single isolated event, such as a noise click, is ignored, while tones and anything repeated in another window read exactly at any modulation frequency.
+  - **Deviation BW** (side panel): *Full* (default) measures everything up to 96 kHz, including subcarriers. *60 kHz* measures through a flat filter that still includes RDS, which leaves out most of the receiver's high-frequency noise. Subcarriers above 60 kHz (e.g. SCA, DARC) then don't count. MPX power, pilot and RDS are unaffected by this setting.
+  - **Peak response** (side panel): *Instant*, *125 µs* (default), *250 µs*, *500 µs* or *1 ms*. Like a hardware modulation monitor, the peak goes through an integrating detector with that attack time (1 s release), run on the MPX upsampled ×4 so high-frequency peaks aren't missed between samples.
+    - **What it filters out:** excursions much shorter than the response time, such as noise and isolated overshoots, read lower. Tones and sustained modulation read their full peak, because the detector is calibrated to read a sine exactly (within 0.05% from 1 to 76 kHz in every mode).
+    - **Instant:** the highest sample, the plugin's original behaviour.
+  - **Noise:** receiver noise adds to the true peak, so noisy signals still read somewhat high. On a test signal with 20 dB CNR, a 75 kHz tone reads 112.6% at Instant, 105.3% at 125 µs and 102.6% at 1 ms (Full bandwidth). The 60 kHz setting reduces this further.
 - **Pilot (kHz):** the level of the 19 kHz stereo pilot as deviation, averaged over 1 second. A typical 9% pilot reads 6.75 kHz; hover over it to see it as a percentage.
   - **How:** the MPX is correlated with a 19 kHz reference over 10 ms windows, so stereo audio and noise hardly affect it.
   - **No pilot:** shows "none" below 0.5 kHz, e.g. on mono stations.
 - **RDS (kHz):** the RDS injection level as peak deviation, averaged over 1 second. Typical values are 2–4 kHz; hover over it to see it as a percentage.
   - **How:** the 57 kHz band is shifted to 0 Hz and filtered to the RDS bandwidth. RDS has almost no energy exactly at 57 kHz, while noise does, so the noise in the band is estimated and removed. The remaining RMS level is converted to peak deviation with a crest factor of 1.51. That's the value real encoders show against reference instruments: a calibrated transmitter measured with MPX Tool, and a Pira P175-calibrated receiver across 21 stations, agree within 0.5%. The theoretical EN 50067 waveform would give 1.444, about 4.5% lower.
   - **Result:** readings stay accurate on noisy signals, matching a peak reading on a clean one.
-  - **No RDS:** shows "none" when there's no RDS, i.e. when the band holds less than twice as much RDS power as noise, or the level is below 0.3 kHz.
+  - **Weak RDS:** a normal reading needs at least twice as much RDS power as noise in the RDS band (3 dB in-band SNR) over 1 second. Below that, the plugin averages its signal estimate over 5 seconds and uses how much that estimate varies to decide what it can say:
+
+    | RDS row | Meaning |
+    |---|---|
+    | `3.01 kHz` | Normal reading |
+    | `~1.06 kHz` (amber) | Weak RDS: level averaged over 5 s, shown only when it's within about ±8%. The tooltip shows the uncertainty and in-band SNR |
+    | `weak` (amber) | RDS is clearly present but too weak to give a level |
+    | `none` | Nothing distinguishable from noise |
+
+  - **Thresholds:** RDS counts as present at about 4 standard deviations above zero, and a level is shown from about 6. Noise-only signals essentially never show "weak". Each state has a little hysteresis, so the display doesn't flicker at a boundary.
+  - **Range:** on test signals the weak range reaches about −5 dB in-band SNR, where a hump at 57 kHz is barely visible in the spectrum.
+  - **RDS lock:** shows "--" for weak RDS, because the phase can't be checked reliably at that SNR.
 - **RDS lock:** whether the RDS 57 kHz subcarrier is phase-locked to the third harmonic of the 19 kHz pilot, as EN 50067 / IEC 62106 require for stereo stations. The standard allows in phase (0°) or quadrature (90°), within ±10°.
   - **Readings:** *Yes* with the phase offset (e.g. "Yes +2°"), green when within tolerance and amber when not. *No* (amber) means the RDS encoder isn't locked to the pilot. *n/a* means there is no pilot or no RDS.
   - **How:** squaring the RDS signal removes its data and leaves the carrier phase. This is compared with 3× the pilot phase every 10 ms and averaged over 5 seconds.
@@ -141,6 +157,8 @@ SDR++ remembers the device and rate selection for the stream. The option isn't a
 | dB Max / dB Min | Vertical scale |
 | Peak hold | Overlay the maximum level seen since the last reset |
 | Level units | Show deviation, pilot and RDS levels in kHz (default) or percent, where 100% = 75 kHz. Hover over Pilot/RDS to see the other unit |
+| Deviation BW | Bandwidth of the deviation measurement: Full (default, up to 96 kHz) or 60 kHz (less receiver noise; subcarriers above 60 kHz don't count) |
+| Peak response | Deviation peak detector response time: Instant, 125 µs (default), 250 µs, 500 µs or 1 ms. Longer times read short spikes and noise lower; tones read their full peak at any setting |
 | Sample type | Int16 (default) / Int32 / Float32 WAV samples |
 | Audio output | Send the MPX to an SDR++ sink (sound device / network), configured in the Sinks menu. Off by default; not on Android |
 
@@ -151,6 +169,7 @@ SDR++ remembers the device and rate selection for the stream. The option isn't a
 **Safety first:**
 - **Coax only:** connect the HackRF to the receiver by coax through **30–40 dB of fixed attenuation**. An RTL-SDR can be damaged above about +10 dBm.
 - **Low output:** keep the HackRF's TX amplifier off (the script uses `-a 0`) and its TX gain low (`--txvga 0..10`).
+- **Without an attenuator:** a direct cable with the amp off and TX VGA around 0–4 (very roughly −40 dBm) is far below an RTL-SDR's damage level, but can overload it. Set the RTL gain low (start at 0 dB, AGC off) and check for a single clean signal. `tools/mpx_testsuite.sh` refuses TX VGA above 20 unless `FORCE=1` is set.
 - **Don't radiate:** nothing should be transmitted over the air. Follow your local regulations.
 
 The deviation of the generated signal is exact by construction. The only error is the HackRF's clock, about 0.002%. The FM is generated with continuous phase, like a real transmitter, so a loopback test is realistic.
@@ -166,6 +185,8 @@ python3 tools/mpx_testgen.py --left 400:40 --right 1500:40 --pilot 9 --rds 4 --r
 python3 tools/mpx_testgen.py --pilot 9 --rds 4 --rds-offset 0.5 --out unlocked.cs8 --tx 100.0e6
 python3 tools/mpx_testgen.py --tone 31185:100 --out bessel.cs8 --tx 100.0e6
 ```
+
+To run the whole calibration suite (17 signals, each transmitted until you press Enter, with the expected readings printed): `bash tools/mpx_testsuite.sh [centre Hz] [TX VGA dB]`.
 
 **What to expect:**
 - **Pilot, tones and MPX power:** within about 0.5%. The generator prints the expected peak deviation and MPX power for each signal.

@@ -23,6 +23,10 @@
 
 #define MPX_METER_FONT_SCALE    1.4f
 
+// Peak response time options, in the order of MPX_DEV_RESPONSE_TIMES ("\xC2\xB5" = micro sign)
+const char* MPX_RESPONSE_NAMES = "Instant\0" "125 \xC2\xB5s\0" "250 \xC2\xB5s\0" "500 \xC2\xB5s\0" "1 ms\0";
+const char* MPX_RESPONSE_KEYS[MPX_DEV_RESPONSE_COUNT] = { "instant", "125us", "250us", "500us", "1ms" };
+
 SDRPP_MOD_INFO{
     /* Name:            */ "mpx_analyzer",
     /* Description:     */ "FM MPX spectrum analyzer and recorder for SDR++",
@@ -64,6 +68,8 @@ public:
         chain.init(vfo->output);
         chain.setAveraging(avgFrames);
         chain.setAnalysis(showWindow);
+        chain.setDeviationBandLimited(devBandLimited);
+        chain.setDeviationResponse(devResponseId);
         chain.start();
 
         // Optional MPX output to an SDR++ sink (sound device, network...)
@@ -136,6 +142,12 @@ private:
         if (conf.contains("dbMax")) { dbMax = conf["dbMax"]; }
         if (conf.contains("peakHold")) { peakHold = conf["peakHold"]; }
         if (conf.contains("levelUnits")) { levelPercent = (conf["levelUnits"] == "percent"); }
+        if (conf.contains("devBandwidth")) { devBandLimited = (conf["devBandwidth"] == "60k"); }
+        if (conf.contains("devResponse")) {
+            for (int i = 0; i < MPX_DEV_RESPONSE_COUNT; i++) {
+                if (conf["devResponse"] == MPX_RESPONSE_KEYS[i]) { devResponseId = i; }
+            }
+        }
         if (conf.contains("recPath")) { folderSelect.setPath(conf["recPath"]); }
         if (conf.contains("sampleType") && sampleTypes.keyExists(conf["sampleType"])) {
             sampleTypeId = sampleTypes.keyId(conf["sampleType"]);
@@ -392,6 +404,33 @@ private:
         if (ImGui::Combo(CONCAT("##_mpx_units_", _this->name), &unitId, "kHz\0% (100% = 75 kHz)\0")) {
             _this->levelPercent = (unitId == 1);
             _this->saveSetting("levelUnits", std::string(_this->levelPercent ? "percent" : "khz"));
+        }
+
+        // Bandwidth of the deviation measurement only (MPX power, pilot and RDS always use the full band)
+        int devBwId = _this->devBandLimited ? 1 : 0;
+        ImGui::LeftLabel("Deviation BW");
+        ImGui::FillWidth();
+        if (ImGui::Combo(CONCAT("##_mpx_devbw_", _this->name), &devBwId, "Full\0" "60 kHz\0")) {
+            _this->devBandLimited = (devBwId == 1);
+            _this->chain.setDeviationBandLimited(_this->devBandLimited);
+            _this->saveSetting("devBandwidth", std::string(_this->devBandLimited ? "60k" : "full"));
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Full: deviation includes everything up to 96 kHz (subcarriers and receiver noise).\n"
+                              "60 kHz: leaves out most receiver noise; subcarriers above 60 kHz (e.g. SCA, DARC) don't count.");
+        }
+
+        // Peak response time of the deviation measurement
+        ImGui::LeftLabel("Peak response");
+        ImGui::FillWidth();
+        if (ImGui::Combo(CONCAT("##_mpx_devresp_", _this->name), &_this->devResponseId, MPX_RESPONSE_NAMES)) {
+            _this->chain.setDeviationResponse(_this->devResponseId);
+            _this->saveSetting("devResponse", std::string(MPX_RESPONSE_KEYS[_this->devResponseId]));
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("How long an excursion must last to count at its full level.\n"
+                              "Instant: the highest sample. Longer times read short spikes and noise lower,\n"
+                              "while tones and sustained modulation still read their full peak.");
         }
 
 #ifndef __ANDROID__
@@ -667,7 +706,7 @@ private:
 
         // Peak deviation over 1s with max hold
         const char* noLevel = levelPercent ? "--.- %" : "--.- kHz";
-        ImGui::TextDisabled("Deviation (1 s peak)");
+        ImGui::TextDisabled(devBandLimited ? "Deviation (1 s, 60k)" : "Deviation (1 s peak)");
         if (valid) { formatLevel(buf, sizeof(buf), meas.peakDevKHz, levelPercent, false); }
         meterValue(valid ? ((meas.peakDevKHz > maxDev) ? overCol : normalCol) : dimCol, valid ? buf : noLevel);
         if (valid) {
@@ -699,7 +738,26 @@ private:
             meterRow(width, "RDS", normalCol, "%s", buf);
             if (ImGui::IsItemHovered()) {
                 formatLevel(alt, sizeof(alt), meas.rdsKHz, !levelPercent, true);
-                ImGui::SetTooltip("57 kHz RDS: %s", alt);
+                ImGui::SetTooltip("57 kHz RDS: %s\nIn-band SNR %.1f dB", alt, meas.rdsSnrDb);
+            }
+        }
+        else if (valid && meas.rdsWeak) {
+            // Weak: a 5s estimate, marked as approximate
+            char lvl[32];
+            formatLevel(lvl, sizeof(lvl), meas.rdsKHz, levelPercent, true);
+            snprintf(buf, sizeof(buf), "~%s", lvl);
+            meterRow(width, "RDS", warnCol, "%s", buf);
+            if (ImGui::IsItemHovered()) {
+                formatLevel(alt, sizeof(alt), meas.rdsKHz, !levelPercent, true);
+                ImGui::SetTooltip("Weak RDS: %s, approximately (about \xC2\xB1%.0f%%)\n"
+                                  "In-band SNR %.1f dB, level averaged over 5 s",
+                                  alt, std::max<float>(1.0f, meas.rdsUncertaintyPct), meas.rdsSnrDb);
+            }
+        }
+        else if (valid && meas.rdsDetected) {
+            meterRow(width, "RDS", warnCol, "weak");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("RDS is present but too weak to measure its level\nIn-band SNR about %.1f dB", meas.rdsSnrDb);
             }
         }
         else {
@@ -725,8 +783,10 @@ private:
                                   meas.lockPhaseDeg, meas.lockCoherence, meas.lockSeconds, MPX_LOCK_MIN_COHERENCE);
             }
         }
-        else if (valid && meas.pilotPresent && meas.rdsPresent) {
+        else if (valid && meas.pilotPresent && meas.rdsDetected) {
+            // Not yet enough data, or RDS too weak for a trustworthy phase
             meterRow(width, "RDS lock", dimCol, "--");
+            if (!meas.rdsPresent && ImGui::IsItemHovered()) { ImGui::SetTooltip("RDS is too weak to check its phase lock"); }
         }
         else {
             meterRow(width, "RDS lock", dimCol, "%s", valid ? "n/a" : "--");
@@ -889,6 +949,8 @@ private:
     float dbMax = 0.0f;
     bool peakHold = false;
     bool levelPercent = false;
+    bool devBandLimited = false;
+    int devResponseId = MPX_DEV_RESPONSE_DEFAULT;
     FolderSelect folderSelect;
     OptionList<std::string, wav::SampleType> sampleTypes;
     int sampleTypeId = 0;

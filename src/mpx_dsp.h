@@ -9,12 +9,14 @@
 #include <dsp/window/blackman.h>
 #include <dsp/channel/rx_vfo.h>
 #include <dsp/multirate/power_decimator.h>
+#include <dsp/multirate/polyphase_resampler.h>
 #include <dsp/filter/fir.h>
 #include <dsp/taps/estimate_tap_count.h>
 #include <dsp/buffer/buffer.h>
 #include <utils/wav.h>
 #include <utils/flog.h>
 #include <fftw3.h>
+#include <algorithm>
 #include <atomic>
 #include <functional>
 #include <mutex>
@@ -53,7 +55,28 @@
 #define MPX_METER_BLOCK         19200
 #define MPX_POWER_LONG_BLOCKS   600     // 60s integration for MPX power (ITU-R BS.412)
 #define MPX_POWER_SHORT_BLOCKS  10      // 1s short term MPX power
-#define MPX_PEAK_BLOCKS         10      // Peak deviation over the last 1s
+#define MPX_PEAK_BLOCKS         10      // Pilot and RDS averages over the last 1s
+
+// Peak deviation: peaks of 50ms windows; the 1s reading ignores the highest MPX_DEV_IGNORE of the last 20
+#define MPX_DEV_WINDOW          9600
+#define MPX_DEV_WINDOWS         20
+#define MPX_DEV_IGNORE          1
+// Optional band limit for the deviation reading: flat to 60kHz (RDS included), most receiver noise removed
+#define MPX_DEV_LP_CUTOFF       63000.0
+#define MPX_DEV_LP_TRANS        6000.0
+
+// Peak response time: an integrating peak detector (attack time constant = response time) run on the MPX
+// upsampled x4, so the peaks of high frequency tones are not missed between samples. Excursions much
+// shorter than the response time read low; tones and sustained programme read their full peak
+#define MPX_DEV_UPSAMPLE        4
+#define MPX_DEV_UP_CUTOFF       96000.0
+#define MPX_DEV_UP_TRANS        24000.0
+#ifndef MPX_DEV_RELEASE
+#define MPX_DEV_RELEASE         1.0     // Detector release time constant (s)
+#endif
+#define MPX_DEV_RESPONSE_COUNT  5
+const double MPX_DEV_RESPONSE_TIMES[MPX_DEV_RESPONSE_COUNT] = { 0.0, 125e-6, 250e-6, 500e-6, 1e-3 };   // 0 = instant
+#define MPX_DEV_RESPONSE_DEFAULT 1      // 125 us
 #define MPX_SETTLE_BLOCKS       5       // Blocks ignored after a reset while the DC filter settles
 
 // 0dBr = power of a sine giving +/-19kHz deviation (ITU-R BS.412), in demodulator units (1.0 = 75kHz)
@@ -82,6 +105,11 @@
 // estimated from the power of 10ms means (~ +/-50Hz around 57kHz), see computeNoiseDcFraction()
 // RDS is considered present when its power is at least this many times the noise power in its band
 #define MPX_RDS_MIN_SNR         2.0
+// Weak RDS (below MPX_RDS_MIN_SNR): decided from the spread of the per block estimates over 5s.
+// Detected at 4 standard errors (a false "weak" on noise is very rare), a level is shown from 6 (about +/-8%)
+#define MPX_RDS_DETECT_SIGMA    4.0
+#define MPX_RDS_LEVEL_SIGMA     6.0
+#define MPX_RDS_WEAK_MIN_BLOCKS 20      // 2s of data before judging weak RDS
 // Peak/RMS ratio used to report the RDS level as peak deviation. The theoretical EN 50067 waveform gives
 // 1.444, but real encoders and reference instruments read ~4.5% higher: a calibrated transmitter checked
 // with MPX Tool implies 1.51-1.52, and a Pira P175-calibrated receiver (VibeSDR, 21 UK stations) 1.507
@@ -97,12 +125,16 @@ struct MPXMeasurements {
     float powerDBr;         // MPX power over the last 60s (or since reset, if shorter)
     float powerShortDBr;    // MPX power over the last 1s
     float powerSeconds;     // Seconds integrated in powerDBr (up to 60)
-    float peakDevKHz;       // Peak deviation over the last 1s
-    float maxDevKHz;        // Peak deviation since reset
+    float peakDevKHz;       // Peak deviation over the last 1s, ignoring a single isolated 50ms window
+    float maxDevKHz;        // Highest 1s peak deviation since reset
     float pilotKHz;         // 19kHz pilot level (deviation) over the last 1s
     bool pilotPresent;
     float rdsKHz;           // RDS level (peak deviation, from noise corrected RMS) over the last 1s
-    bool rdsPresent;
+    bool rdsPresent;        // Strong enough for the 1s level
+    bool rdsWeak;           // Weak: rdsKHz is a 5s estimate, within about rdsUncertaintyPct
+    bool rdsDetected;       // RDS is there (present, weak, or too weak to give a level)
+    float rdsSnrDb;         // In-band RDS signal to noise ratio
+    float rdsUncertaintyPct;
     bool lockValid;         // Pilot and RDS both present and enough data for the lock measurement
     bool locked;            // RDS 57kHz carrier locked to the 3rd harmonic of the pilot
     float lockCoherence;    // 0..1, stability of the RDS/pilot phase difference
@@ -158,6 +190,25 @@ public:
         rdsMix = dsp::buffer::alloc<dsp::complex_t>(MPX_RDS_CHUNK);
         rdsBase = dsp::buffer::alloc<dsp::complex_t>(MPX_RDS_CHUNK);
 
+        // Deviation path buffers and its optional 60kHz low pass (normalized to unity gain)
+        measX = dsp::buffer::alloc<float>(STREAM_BUFFER_SIZE);
+        devY = dsp::buffer::alloc<float>(STREAM_BUFFER_SIZE);
+        devTaps = dsp::taps::lowPass(MPX_DEV_LP_CUTOFF, MPX_DEV_LP_TRANS, MPX_SAMPLERATE, true);
+        double devSum = 0.0;
+        for (int i = 0; i < devTaps.size; i++) { devSum += devTaps.taps[i]; }
+        for (int i = 0; i < devTaps.size; i++) { devTaps.taps[i] /= devSum; }
+        devFir.init(NULL, devTaps);
+        devFir.out.free();
+
+        // x4 interpolation for the peak detector (taps scaled by the interpolation for unity gain)
+        devUpTaps = dsp::taps::lowPass(MPX_DEV_UP_CUTOFF, MPX_DEV_UP_TRANS, MPX_SAMPLERATE * MPX_DEV_UPSAMPLE);
+        double upSum = 0.0;
+        for (int i = 0; i < devUpTaps.size; i++) { upSum += devUpTaps.taps[i]; }
+        for (int i = 0; i < devUpTaps.size; i++) { devUpTaps.taps[i] *= MPX_DEV_UPSAMPLE / upSum; }
+        devUp.init(NULL, MPX_DEV_UPSAMPLE, 1, devUpTaps);
+        devUp.out.free();
+        devUpBuf = dsp::buffer::alloc<float>(STREAM_BUFFER_SIZE * MPX_DEV_UPSAMPLE);
+
         // Pilot at 0Hz through an identical filter, so its phase lines up exactly with the RDS samples
         lockPilotFir.init(NULL, rdsTaps, MPX_RDS_DECIM);
         lockPilotFir.out.free();
@@ -178,6 +229,11 @@ public:
         dsp::taps::free(rdsTaps);
         dsp::buffer::free(rdsMix);
         dsp::buffer::free(rdsBase);
+        dsp::buffer::free(measX);
+        dsp::buffer::free(devY);
+        dsp::taps::free(devTaps);
+        dsp::taps::free(devUpTaps);
+        dsp::buffer::free(devUpBuf);
         dsp::buffer::free(lockPilotMix);
         dsp::buffer::free(lockPilotBase);
     }
@@ -413,6 +469,16 @@ public:
 
     // ---- Measurements ----
 
+    // Measure deviation on the full band (false) or band limited to 60kHz (true)
+    void setDeviationBandLimited(bool limited) {
+        devLimited = limited;
+    }
+
+    // Peak response time, an index into MPX_DEV_RESPONSE_TIMES (0 = instant)
+    void setDeviationResponse(int index) {
+        devResponse = std::clamp<int>(index, 0, MPX_DEV_RESPONSE_COUNT - 1);
+    }
+
     // Restart the MPX power integration and peak deviation hold (e.g. after retuning)
     void resetMeasurements() {
         measReset = true;
@@ -499,9 +565,8 @@ private:
             powerPos = 0;
             peakFill = 0;
             peakPos = 0;
-            maxPeak = 0.0f;
+            resetDeviation();
             blkSumSq = 0.0;
-            blkPeak = 0.0f;
             blkCount = 0;
             settleBlocks = MPX_SETTLE_BLOCKS;
             pilotI = pilotQ = 0.0;
@@ -518,17 +583,63 @@ private:
             lockWeight = 0.0;
             lockPos = 0;
             lockFill = 0;
+            rdsWeakState = 0;
             std::lock_guard<std::mutex> lck(measMtx);
             measValid = false;
         }
 
         measureRDS(data, count);
 
+        // Remove DC (a slightly off-centre carrier is not modulation)
         for (int i = 0; i < count; i++) {
             dcEst += MPX_DC_ALPHA * (data[i] - dcEst);
-            float x = data[i] - dcEst;
+            measX[i] = data[i] - dcEst;
+        }
+
+        // Deviation is measured on the full band, or optionally band limited to 60kHz to keep most of the
+        // receiver noise out of the peak. Switching starts the deviation readings afresh
+        bool limited = devLimited;
+        if (limited != devLimitedActive) {
+            devLimitedActive = limited;
+            resetDeviation();
+            devFir.reset();
+        }
+        const float* dev = measX;
+        if (limited) {
+            devFir.process(count, measX, devY);
+            dev = devY;
+        }
+
+        // Peak response time: instant = sample peak, otherwise the integrating detector on the x4 signal
+        int response = devResponse;
+        if (response != devResponseActive) {
+            devResponseActive = response;
+            resetDeviation();
+            devUp.reset();
+            double fsUp = MPX_SAMPLERATE * MPX_DEV_UPSAMPLE;
+            devAttack = (response > 0) ? (float)(1.0 - exp(-1.0 / (MPX_DEV_RESPONSE_TIMES[response] * fsUp))) : 1.0f;
+            devRelease = (float)exp(-1.0 / (MPX_DEV_RELEASE * fsUp));
+            devCal = (response > 0) ? sineCalibration(devAttack, devRelease, fsUp) : 1.0f;
+        }
+        if (response > 0) { devUp.process(count, dev, devUpBuf); }
+
+        for (int i = 0; i < count; i++) {
+            float x = measX[i];
             blkSumSq += x * x;
-            blkPeak = std::max<float>(blkPeak, fabsf(x));
+
+            if (response > 0) {
+                const float* up = &devUpBuf[i * MPX_DEV_UPSAMPLE];
+                for (int j = 0; j < MPX_DEV_UPSAMPLE; j++) {
+                    float v = fabsf(up[j]);
+                    if (v > devDetector) { devDetector += devAttack * (v - devDetector); }
+                    else { devDetector *= devRelease; }
+                }
+                devWinPeak = std::max<float>(devWinPeak, devDetector * devCal);
+            }
+            else {
+                devWinPeak = std::max<float>(devWinPeak, fabsf(dev[i]));
+            }
+            if (++devWinCount == MPX_DEV_WINDOW) { finishDeviationWindow(); }
 
             // Pilot: correlate with 19kHz over a windowed block
             float wx = pilotWin[pilotCount] * x;
@@ -582,6 +693,56 @@ private:
             dc += h2 * d * d;
         }
         return dc / total;
+    }
+
+    // The detector drains slightly between the peaks of a steady tone, reading it a fixed fraction low
+    // (independent of level and modulation frequency). Like a hardware meter, it is calibrated to read a
+    // sine wave's peak exactly: the detector is simulated on a full scale 1kHz sine
+    static float sineCalibration(float attack, float release, double fsUp) {
+        double p = 0.0, peak = 0.0;
+        long n = (long)(fsUp * 0.5);
+        for (long i = 0; i < n; i++) {
+            double v = fabs(sin(2.0 * FL_M_PI * 1000.0 * i / fsUp));
+            if (v > p) { p += attack * (v - p); }
+            else { p *= release; }
+            if (i > n / 2) { peak = std::max<double>(peak, p); }
+        }
+        return (peak > 0.0) ? (float)(1.0 / peak) : 1.0f;
+    }
+
+    void resetDeviation() {
+        devWinPeak = 0.0f;
+        devWinCount = 0;
+        devWinPos = 0;
+        devWinFill = 0;
+        devReading = 0.0f;
+        devMax = 0.0f;
+        devDetector = 0.0f;
+    }
+
+    // Peak of each 50ms window (as a Pira does). The 1s reading is the (MPX_DEV_IGNORE + 1)th highest of
+    // the last 20 windows, so a single isolated event such as a noise click doesn't count, while a tone or
+    // any excursion repeated in another window reads exactly, at any modulation frequency
+    void finishDeviationWindow() {
+        float peak = devWinPeak;
+        devWinPeak = 0.0f;
+        devWinCount = 0;
+        if (settleBlocks > 0) { return; }   // DC filter still settling after a reset
+
+        devWinRing[devWinPos] = peak;
+        devWinPos = (devWinPos + 1) % MPX_DEV_WINDOWS;
+        devWinFill = std::min<int>(devWinFill + 1, MPX_DEV_WINDOWS);
+
+        float sorted[MPX_DEV_WINDOWS];
+        std::copy(devWinRing, devWinRing + devWinFill, sorted);
+        std::sort(sorted, sorted + devWinFill, std::greater<float>());
+        if (devWinFill > MPX_DEV_IGNORE) {
+            devReading = sorted[MPX_DEV_IGNORE];
+            devMax = std::max<float>(devMax, devReading);
+        }
+        else {
+            devReading = sorted[0];
+        }
     }
 
     void measureRDS(float* data, int count) {
@@ -638,9 +799,7 @@ private:
 
     void finishBlock() {
         double meanSq = blkSumSq / (double)MPX_METER_BLOCK;
-        float peak = blkPeak;
         blkSumSq = 0.0;
-        blkPeak = 0.0f;
         blkCount = 0;
 
         float pilotAmp = pilotAmpCount ? (pilotAmpSum / pilotAmpCount) : 0.0f;
@@ -665,18 +824,19 @@ private:
         powerPos = (powerPos + 1) % MPX_POWER_LONG_BLOCKS;
         powerFill = std::min<int>(powerFill + 1, MPX_POWER_LONG_BLOCKS);
 
-        peakRing[peakPos] = peak;
         pilotRing[peakPos] = pilotAmp;
         rdsDcRing[peakPos] = rdsDc;
         rdsTotRing[peakPos] = rdsTot;
         peakPos = (peakPos + 1) % MPX_PEAK_BLOCKS;
 
+        // Per block RDS signal power estimate (can be negative on noise), for the 5s weak RDS detection
+        rdsSigRing[lockPos] = ((rdsNoiseDcFraction * rdsTot) - rdsDc) / (rdsNoiseDcFraction - rdsSignalDcFraction);
+        rdsTot5Ring[lockPos] = rdsTot;
         lockVecRing[lockPos] = blkLockVec;
         lockWeightRing[lockPos] = blkLockWeight;
         lockPos = (lockPos + 1) % MPX_LOCK_BLOCKS;
         lockFill = std::min<int>(lockFill + 1, MPX_LOCK_BLOCKS);
         peakFill = std::min<int>(peakFill + 1, MPX_PEAK_BLOCKS);
-        maxPeak = std::max<float>(maxPeak, peak);
 
         // Average over the most recent blocks
         double longSum = 0.0, shortSum = 0.0;
@@ -686,10 +846,8 @@ private:
             longSum += p;
             if (k <= shortCount) { shortSum += p; }
         }
-        float recentPeak = 0.0f;
         double pilotSum = 0.0, rdsDcSum = 0.0, rdsTotSum = 0.0;
         for (int k = 0; k < peakFill; k++) {
-            recentPeak = std::max<float>(recentPeak, peakRing[k]);
             pilotSum += pilotRing[k];
             rdsDcSum += rdsDcRing[k];
             rdsTotSum += rdsTotRing[k];
@@ -699,8 +857,8 @@ private:
         meas.powerDBr = 10.0 * log10(std::max<double>(longSum / powerFill, 1e-20) / MPX_POWER_REF);
         meas.powerShortDBr = 10.0 * log10(std::max<double>(shortSum / shortCount, 1e-20) / MPX_POWER_REF);
         meas.powerSeconds = (powerFill * MPX_METER_BLOCK) / MPX_SAMPLERATE;
-        meas.peakDevKHz = recentPeak * (MPX_DEVIATION / 1000.0);
-        meas.maxDevKHz = maxPeak * (MPX_DEVIATION / 1000.0);
+        meas.peakDevKHz = devReading * (MPX_DEVIATION / 1000.0);
+        meas.maxDevKHz = devMax * (MPX_DEVIATION / 1000.0);
         meas.pilotKHz = (pilotSum / peakFill) * (MPX_DEVIATION / 1000.0);
         meas.pilotPresent = (meas.pilotKHz >= MPX_PILOT_MIN_KHZ);
 
@@ -713,6 +871,41 @@ private:
         double rdsNoise = rdsTotal - rdsSignal;
         meas.rdsKHz = 2.0 * sqrt(rdsSignal) * MPX_RDS_CREST_FACTOR * (MPX_DEVIATION / 1000.0);
         meas.rdsPresent = (meas.rdsKHz >= MPX_RDS_MIN_KHZ) && (rdsSignal >= MPX_RDS_MIN_SNR * rdsNoise);
+        meas.rdsSnrDb = 10.0 * log10(std::max<double>(rdsSignal, 1e-30) / std::max<double>(rdsNoise, 1e-30));
+        meas.rdsWeak = false;
+        meas.rdsDetected = meas.rdsPresent;
+        meas.rdsUncertaintyPct = 0.0f;
+
+        // Weak RDS: average the per block signal estimates over 5s and use their measured spread to decide
+        // whether RDS is really there (MPX_RDS_DETECT_SIGMA) and whether its level is usable (MPX_RDS_LEVEL_SIGMA)
+        if (!meas.rdsPresent && lockFill >= MPX_RDS_WEAK_MIN_BLOCKS) {
+            double sMean = 0.0, tMean = 0.0;
+            for (int k = 0; k < lockFill; k++) {
+                sMean += rdsSigRing[k];
+                tMean += rdsTot5Ring[k];
+            }
+            sMean /= lockFill;
+            tMean /= lockFill;
+            double var = 0.0;
+            for (int k = 0; k < lockFill; k++) { var += (rdsSigRing[k] - sMean) * (rdsSigRing[k] - sMean); }
+            double sigma = sqrt(var / (lockFill - 1)) / sqrt((double)lockFill);
+            double noise = std::max<double>(tMean - sMean, 1e-30);
+
+            // Hysteresis: leaving a state takes a 1 sigma lower threshold than entering it, so the display
+            // doesn't flicker between states when the signal sits right at a threshold
+            double detectThr = (MPX_RDS_DETECT_SIGMA - (rdsWeakState >= 1 ? 1.0 : 0.0)) * sigma;
+            double levelThr = (MPX_RDS_LEVEL_SIGMA - (rdsWeakState >= 2 ? 1.0 : 0.0)) * sigma;
+            if (sigma > 0.0 && sMean >= detectThr) {
+                meas.rdsDetected = true;
+                meas.rdsSnrDb = 10.0 * log10(sMean / noise);
+                if (sMean >= levelThr) {
+                    meas.rdsWeak = true;
+                    meas.rdsKHz = 2.0 * sqrt(sMean) * MPX_RDS_CREST_FACTOR * (MPX_DEVIATION / 1000.0);
+                    meas.rdsUncertaintyPct = 100.0 * 0.5 * sigma / sMean;   // level ~ sqrt(power)
+                }
+            }
+        }
+        rdsWeakState = meas.rdsPresent ? 2 : (meas.rdsWeak ? 2 : (meas.rdsDetected ? 1 : 0));
 
         // Lock: a stable phase difference gives a long average vector, a drifting one averages out
         std::complex<double> lockSum = 0.0;
@@ -838,17 +1031,38 @@ private:
     // Measurements (DSP thread only)
     float dcEst = 0.0f;
     double blkSumSq = 0.0;
-    float blkPeak = 0.0f;
     int blkCount = 0;
     int settleBlocks = MPX_SETTLE_BLOCKS;
     double powerRing[MPX_POWER_LONG_BLOCKS];
     int powerPos = 0;
     int powerFill = 0;
-    float peakRing[MPX_PEAK_BLOCKS];
     int peakPos = 0;
     int peakFill = 0;
-    float maxPeak = 0.0f;
     std::atomic<bool> measReset = false;
+    float* measX;           // DC removed MPX
+    float* devY;            // Band limited MPX for the deviation (60kHz option)
+
+    // Deviation (DSP thread only)
+    dsp::tap<float> devTaps;
+    dsp::filter::FIR<float, float> devFir;
+    std::atomic<bool> devLimited = false;
+    bool devLimitedActive = false;
+    float devWinPeak = 0.0f;
+    int devWinCount = 0;
+    float devWinRing[MPX_DEV_WINDOWS];
+    int devWinPos = 0;
+    int devWinFill = 0;
+    float devReading = 0.0f;
+    float devMax = 0.0f;
+    dsp::tap<float> devUpTaps;
+    dsp::multirate::PolyphaseResampler<float> devUp;
+    float* devUpBuf;
+    std::atomic<int> devResponse = MPX_DEV_RESPONSE_DEFAULT;
+    int devResponseActive = -1;
+    float devAttack = 1.0f;
+    float devRelease = 1.0f;
+    float devDetector = 0.0f;
+    float devCal = 1.0f;
 
     // Pilot and RDS level (DSP thread only)
     float pilotCos[MPX_TONE_TABLE];
@@ -891,6 +1105,9 @@ private:
     int lockFill = 0;
     double rdsDcRing[MPX_PEAK_BLOCKS];
     double rdsTotRing[MPX_PEAK_BLOCKS];
+    double rdsSigRing[MPX_LOCK_BLOCKS];
+    int rdsWeakState = 0;   // 0 none, 1 detected, 2 level shown (for hysteresis)
+    double rdsTot5Ring[MPX_LOCK_BLOCKS];
 
     // Measurements (shared with the GUI)
     std::mutex measMtx;
