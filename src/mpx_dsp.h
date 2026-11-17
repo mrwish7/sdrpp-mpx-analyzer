@@ -43,6 +43,7 @@
 #define MPX_EQ_PROBE_LEN    3072    // Output samples analysed (tones fall exactly on bins)
 #define MPX_EQ_MAX_FREQ     150000.0
 #define MPX_EQ_TAPS         401
+#define MPX_EQ_PROBE_SECONDS 0.08   // Probe signal length (filters settle in a few ms)
 
 #define MPX_FFT_SIZE        4096
 #define MPX_FFT_BINS        ((MPX_FFT_SIZE / 2) + 1)
@@ -320,10 +321,12 @@ public:
             }
         }
 
-        // Run long enough for every filter to settle, keep the last MPX_EQ_PROBE_LEN output samples
+        // Run long enough for every filter to settle, keep the last MPX_EQ_PROBE_LEN output samples.
+        // The output buffer must also fit a VFO that upsamples (input rate below 384kHz)
         const int chunk = 65536;
-        long rawCount = (long)(rawRate * 0.25);
-        std::vector<dsp::complex_t> in(chunk), mid(chunk), out(chunk);
+        long rawCount = (long)(rawRate * MPX_EQ_PROBE_SECONDS);
+        size_t outSize = (size_t)(chunk * std::max<double>(1.0, MPX_IF_SAMPLERATE / vfoInRate)) + 4096;
+        std::vector<dsp::complex_t> in(chunk), mid(chunk), out(outSize);
         std::vector<dsp::complex_t> tail;
         for (long pos = 0; pos < rawCount; pos += chunk) {
             int n = (int)std::min<long>(chunk, rawCount - pos);
@@ -627,7 +630,12 @@ private:
             float x = measX[i];
             blkSumSq += x * x;
 
-            if (response > 0) {
+            if (response > 0 && settleBlocks > 0) {
+                // Hold the detector at zero while settling after a reset: a transient here (startup, retune,
+                // bandwidth change) would otherwise stay charged through the 1s release and latch a false Max
+                devDetector = 0.0f;
+            }
+            else if (response > 0) {
                 const float* up = &devUpBuf[i * MPX_DEV_UPSAMPLE];
                 for (int j = 0; j < MPX_DEV_UPSAMPLE; j++) {
                     float v = fabsf(up[j]);

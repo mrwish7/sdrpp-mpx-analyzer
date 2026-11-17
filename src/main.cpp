@@ -12,6 +12,7 @@
 #include <regex>
 #include <ctime>
 #include <cstdarg>
+#include <cmath>
 #include <dsp/multirate/rational_resampler.h>
 #include "mpx_dsp.h"
 
@@ -236,7 +237,19 @@ private:
     void updateEqualizer() {
         if (!enabled) { return; }
         double rate = sigpath::iqFrontEnd.getSampleRate();
-        if (rate <= 0.0 || rate == eqRate) { return; }
+        if (!std::isfinite(rate) || rate <= 0.0 || rate == eqRate) { return; }
+
+        // Below 384kHz the VFO upsamples and the probe tones would alias: no correction (pass-through).
+        // This is also the rate sources report with no device connected (e.g. RTL-SDR: 250 kS/s)
+        if (rate < MPX_IF_SAMPLERATE) {
+            dsp::tap<float> passThrough = dsp::taps::alloc<float>(1);
+            passThrough.taps[0] = 1.0f;
+            chain.setEqualizer(passThrough);
+            eqRate = rate;
+            eqRippleDb = 0.0f;
+            eqActive = false;
+            return;
+        }
 
         int frontDecim = 1;
         core::configManager.acquire();
@@ -248,6 +261,7 @@ private:
         std::vector<double> resp = MPXChain::measureVfoResponse(rate, frontDecim);
         chain.setEqualizer(MPXChain::designEqualizer(resp));
         eqRate = rate;
+        eqActive = true;
 
         eqRippleDb = 0.0f;
         for (size_t k = 0; k < resp.size() && k * MPX_EQ_PROBE_STEP <= MPX_EQ_MAX_FREQ; k++) {
@@ -348,7 +362,7 @@ private:
         if (_this->enabled && sigpath::iqFrontEnd.getSampleRate() < MPX_IF_SAMPLERATE) {
             ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Source sample rate is below 384 kS/s");
         }
-        if (_this->enabled && _this->eqRate > 0.0) {
+        if (_this->enabled && _this->eqActive) {
             ImGui::TextDisabled("VFO ripple corrected: %.2f dB", _this->eqRippleDb);
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("SDR++'s channel resampler has a small passband ripple at this sample rate.\n"
@@ -969,6 +983,7 @@ private:
     double measBandwidth = 0.0;
     double eqRate = 0.0;
     float eqRippleDb = 0.0f;
+    bool eqActive = false;
 
     EventHandler<ImGui::WaterFall::FFTRedrawArgs> fftRedrawHandler;
     EventHandler<ImGui::WaterFall::InputHandlerArgs> inputHandler;
